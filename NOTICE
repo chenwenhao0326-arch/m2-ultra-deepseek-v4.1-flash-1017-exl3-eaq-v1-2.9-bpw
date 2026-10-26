@@ -4,6 +4,20 @@ Maintained by chenwenhao0326-arch.
 This is an independent deployment and engineering adaptation. It is not an
 official DeepSeek, Apple, mlx-serve, mlx-stream, Sushi or Mia-AiLab release.
 
+Contribution structure:
+  1. M2 runtime enablement: adapt incompatible matrix-kernel paths, migrate
+     existing M2 work to the mixed K2/K3 1017 pack, and integrate host/plugin
+     contracts. The supplied quantized expert weights are reused unchanged.
+  2. Established local optimizations: prefill scheduling, qualified M2 compute
+     reuse, complete answer/session-state reuse and expert-record reuse,
+     together with serving reliability work. These already exist in baseline A.
+  3. Selected new upstream PR/commit adaptations: the measured B variant adds
+     selective extension-cache retention on top of A. Reported A/B gains are
+     incremental, not the cumulative value of all project contributions.
+
+The enablement requirement is scoped to the pinned upstream sources and
+tested M2 environment, not a claim about every later upstream revision.
+
 Core engine:
   mlx-serve — David Dalcu and contributors
   https://github.com/ddalcu/mlx-serve

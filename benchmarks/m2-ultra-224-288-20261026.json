@@ -478,5 +478,16 @@
     "Selective retention only for<=256uncachedinputtokens or native-verifiedshortsuffix; otherinputs use priorfallback.",
     "CPU/GPUconditions mayvaryonothermachines.",
     "Freshstathelperandlonginputexperiments are not shipped."
-  ]
+  ],
+  "comparison_scope": {
+    "baseline_A": "M2 runtime enablement plus established local optimizations; not unmodified upstream.",
+    "optimized_B": "The same adapted baseline plus selective EXL3 extension-cache retention inspired by the pinned new upstream work.",
+    "reported_gain": "Incremental contribution of the third layer only; not a cumulative project-wide speedup.",
+    "project_layers": [
+      "M2 compatibility and host/plugin integration",
+      "Established prefill, compute, session and expert-cache optimizations",
+      "Selected new upstream PR/commit adaptation"
+    ],
+    "reference": "docs/ADAPTATIONS.md"
+  }
 }

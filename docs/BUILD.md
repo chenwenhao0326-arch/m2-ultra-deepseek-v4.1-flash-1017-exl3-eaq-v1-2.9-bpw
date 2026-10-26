@@ -45,6 +45,6 @@ python3 scripts/build.py --profile optimized \
 
 ## 基线构建
 
-将上述命令中的 `--profile optimized` 换成 `--profile baseline`。两者分别放在 `_work/baseline`、`_work/optimized` 和对应 `dist/` 目录。基线包含此前已有优化；优化版额外应用 `mlx-stream-selective-cache.patch`。
+将上述命令中的 `--profile optimized` 换成 `--profile baseline`。两者分别放在 `_work/baseline`、`_work/optimized` 和对应 `dist/` 目录。**两版都包含 M2 运行适配和此前已有优化**；优化版额外应用 `mlx-stream-selective-cache.patch`。选择 `baseline` 不会退回 M2 上未经适配的上游默认算子路径。详见[三层构成](ADAPTATIONS.md)。
 
 构建不加载模型，不修改 `iogpu`，不启动正式服务。生成文件在 `dist/`，不提交到 Git。原生库与适配库会在本地签名，构建哈希会受路径、工具链与 Mach-O 元数据影响；源码指纹与历史测速二进制哈希分别记录，不把它们混为一谈。
