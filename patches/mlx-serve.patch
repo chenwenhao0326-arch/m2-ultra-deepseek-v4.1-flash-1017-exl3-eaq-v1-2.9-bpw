@@ -1,0 +1,1681 @@
+diff --git a/build.zig b/build.zig
+index 0100fd9..886ec0f 100644
+--- a/build.zig
++++ b/build.zig
+@@ -341,6 +341,9 @@ pub fn build(b: *std.Build) void {
+         const t = addMlxStreamTests(b, target, optimize, test_filter, macos_sdk_frameworks, "src/tests.zig", "mlx-stream-test");
+         test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+         const run = b.addRunArtifact(t);
++        // Filtered plugin tests inspect runtime environment (e.g. native memory
++        // feature flags). A cached run cannot validate a changed environment.
++        if (test_filter != null) run.has_side_effects = true;
+         test_step.dependOn(&run.step);
+         b.step("mlx-stream-test", "Run the mlx-stream plugin's tests").dependOn(&run.step);
+         // Its own binary (the last test checks that nothing in it created a Metal device), outside `zig build test`:
+@@ -934,8 +937,10 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
+     const csrc = b.pathJoin(&.{ dir, "csrc" });
+     // A profile server build (`-Dplugin-profile=true`, never the tests) also compiles the decode profile's command-buffer
+     // timeline shims and the read pool's event-signal log (`-DQ3LD_EVSIG`), which the plugin's profile probes link.
+-    const profile = !inject and pluginProfile(b);
+-    const c: []const []const u8 = if (inject)
++    const profile = pluginProfile(b);
++    const c: []const []const u8 = if (inject and profile)
++        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT", "-DQ3LD_EVSIG" }
++    else if (inject)
+         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
+     else if (profile)
+         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
+@@ -967,7 +972,9 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: [
+ /// One of the plugin's own test roots (src/tests.zig, src/conformance.zig) over the host surface plugins import
+ /// (`src/plugin_host.zig`), with the read pool's scripted faults.
+ fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
+-    const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
++    const test_options = b.addOptions();
++    test_options.addOption(bool, "enabled", pluginProfile(b));
++    const host = b.createModule(.{ .root_source_file = b.path(if (pluginProfile(b)) "src/plugin_profile_host.zig" else "src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true, .imports = &.{.{ .name = "plugin_test_options", .module = test_options.createModule() }} });
+     addMlxLib(b, host);
+     addExl3Module(b, host, target, optimize);
+     if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
+diff --git a/src/arch/mlx_stream.zig b/src/arch/mlx_stream.zig
+index bb45d0a..1ab96d2 100644
+--- a/src/arch/mlx_stream.zig
++++ b/src/arch/mlx_stream.zig
+@@ -18,6 +18,7 @@ const scheduler = @import("../scheduler.zig");
+ const ModelConfig = @import("../model.zig").ModelConfig;
+ const plugin = @import("mlx_stream");
+ const sdk = plugin.sdk;
++pub const VisionInput = sdk.VisionInput;
+ 
+ pub const built = true;
+ 
+@@ -100,7 +101,7 @@ fn resolveContext(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config:
+         ceiling: u64,
+         fn need(self: @This(), rung: u64) u64 {
+             const A = Side(k).arch;
+-            var f = facts();
++            var f = facts(self.config) catch return std.math.maxInt(u64);
+             const c = parse(k, self.gpa, self.io, self.config, &f, rung) catch return std.math.maxInt(u64);
+             defer A.freeConfig(self.gpa, c);
+             const bytes = A.loadBytes(self.gpa, self.io, c, &f, self.ceiling) catch return std.math.maxInt(u64);
+@@ -215,8 +216,19 @@ fn maxOutputOf(dir: []const u8) u64 {
+ 
+ /// Sampled before the weights load: the memory already in use, which the plugin's rows fill on top of, and the
+ /// host's wired-limit margin.
+-fn facts() sdk.LoadFacts {
+-    return .{ .memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes(), .wired_margin_bytes = server.wired_limit_margin_bytes };
++fn facts(config: *const ModelConfig) !sdk.LoadFacts {
++    var f: sdk.LoadFacts = .{ .memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes(), .wired_margin_bytes = server.wired_limit_margin_bytes };
++    if (config.dsv41_stream) {
++        f.vision_enabled = config.dsv41_vision_load orelse (config.dsv41_vision and !scheduler.no_vision_global);
++        const decode = if (std.c.getenv("MLX_SERVE_EXPERIMENT_EXPERT_ROWS")) |v| std.mem.span(v) else null;
++        const prefill = if (std.c.getenv("MLX_SERVE_EXPERIMENT_PREFILL_ROWS")) |v| std.mem.span(v) else null;
++        if (try @import("../experiment_stream_rows.zig").parse(decode, prefill)) |rows| {
++            f.expert_rows = rows.decode;
++            f.expert_prefill_rows = rows.prefill;
++            log.info("[experiment] fixed expert rows: prefill={d} decode={d}\n", .{ rows.prefill, rows.decode });
++        }
++    }
++    return f;
+ }
+ 
+ /// What a load holds under the GPU ceiling: the preflight's bill.
+@@ -224,7 +236,7 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig)
+     return switch (kindOf(config)) {
+         inline else => |k| {
+             const A = Side(k).arch;
+-            var f = facts();
++            var f = try facts(config);
+             const c = try parse(k, gpa, io, config, &f, try resolveContext(k, gpa, io, config));
+             defer A.freeConfig(gpa, c);
+             return A.loadBytes(gpa, io, c, &f, server.staticGpuMemoryCeiling());
+@@ -251,13 +263,13 @@ fn openArch(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_str
+     const A = Side(k).arch;
+     if (@TypeOf(A.claimProcess) != void) try A.claimProcess();
+     errdefer if (@TypeOf(A.releaseProcess) != void) A.releaseProcess();
+-    var f = facts();
++    var f = try facts(config);
+     const c = try parse(k, gpa, io, config, &f, try resolveContext(k, gpa, io, config));
+     errdefer A.freeConfig(gpa, c);
+     const dir = config.pack_dir.?;
+     const m = try gpa.create(Model);
+     errdefer gpa.destroy(m);
+-    m.* = .{ .gpa = gpa, .arch = @unionInit(@FieldType(Model, "arch"), @tagName(k), .{ .cfg = c, .module = undefined }), .weights = try sdk.loader.dir(io, gpa, dir, .{ .nocache = A.caps.residents_past_page_cache }) };
++    m.* = .{ .gpa = gpa, .arch = @unionInit(@FieldType(Model, "arch"), @tagName(k), .{ .cfg = c, .module = undefined }), .weights = try sdk.loader.dir(io, gpa, dir, .{ .nocache = A.caps.residents_past_page_cache, .external_vision = k == .dsv41, .vision = f.vision_enabled }) };
+     errdefer m.weights.deinit();
+     const load: sdk.LoadCtx = .{ .gpa = gpa, .io = io, .stream = s, .weights = &m.weights, .loader = &sdk.loader, .facts = f, .ceiling = server.staticGpuMemoryCeiling() };
+     @field(m.arch, @tagName(k)).module = try A.init(&load, c);
+@@ -277,10 +289,28 @@ pub fn close(m: *Model) void {
+     m.gpa.destroy(m);
+ }
+ 
++/// Build an image identity on the inference thread while the slot owns its encoder rows.
++pub fn visionInput(rows: ?mlx.mlx_array, prompt: []const u32, image_id: u32) !?VisionInput {
++    const arr = rows orelse return null;
++    const shape = mlx.getShape(arr);
++    if (shape.len != 3 or shape[0] != 1 or shape[1] <= 0 or shape[2] <= 0) return error.InvalidVisionShape;
++    const offset = try @import("../vision_stream.zig").spanOffset(prompt, image_id, @intCast(shape[1]));
++    var f32_rows = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(f32_rows);
++    try mlx.check(mlx.mlx_astype(&f32_rows, arr, .float32, mlx.gpuStream()));
++    var packed_rows = mlx.mlx_array_new();
++    defer _ = mlx.mlx_array_free(packed_rows);
++    try mlx.check(mlx.mlx_contiguous(&packed_rows, f32_rows, false, mlx.gpuStream()));
++    try mlx.check(mlx.mlx_array_eval(packed_rows));
++    const data = mlx.mlx_array_data_float32(packed_rows) orelse return error.InvalidVisionRows;
++    const key = @import("../vision_identity.zig").key(offset, @intCast(shape[1]), @intCast(shape[2]), std.mem.sliceAsBytes(data[0..mlx.mlx_array_size(packed_rows)]));
++    return .{ .rows = arr, .offset = offset, .key = key };
++}
++
+ /// A request's start: how many leading positions of `prompt` the module's kept state already holds (the rest, at
+ /// least the last token, runs through `forward`), and the shape its prompt pass bills. A prompt past the context
+ /// the load billed is refused before any work (a 400).
+-pub fn begin(m: *Model, prompt: []const u32, max_tokens: u32, context: u64) !u64 {
++pub fn begin(m: *Model, prompt: []const u32, max_tokens: u32, context: u64, vision: ?VisionInput) !u64 {
+     switch (m.arch) {
+         inline else => |b, k| {
+             const A = Side(k).arch;
+@@ -289,7 +319,11 @@ pub fn begin(m: *Model, prompt: []const u32, max_tokens: u32, context: u64) !u64
+                 log.warn("[mlx-stream] a {d}-token prompt is over the {d} tokens this load billed (raise the model's ctx_size)\n", .{ prompt.len, bound });
+                 return error.PrefillDoesNotFit;
+             }
+-            m.request = .{ .prompt_tokens = prompt.len, .max_tokens = max_tokens, .host_context = context };
++            if (comptime k == .dsv41) {
++                try b.module.prepareVision(vision);
++            } else if (vision != null) return error.StreamVisionUnsupported;
++            m.request = .{ .prompt_tokens = prompt.len, .max_tokens = max_tokens, .host_context = context, .vision = vision };
++            if (comptime @hasDecl(A.Module, "prepareIncomingRequest")) b.module.prepareIncomingRequest(m.request.?);
+             m.prompt_due = true;
+             m.handover_due = true;
+             m.drafting = false;
+@@ -306,6 +340,7 @@ pub fn forward(m: *Model, ids: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+             const A = Side(k).arch;
+             if (m.prompt_due) {
+                 m.prompt_due = false;
++                defer m.request.?.vision = null;
+                 break :blk try A.prefill(b.module, ids, m.request.?);
+             }
+             try handover(m);
+diff --git a/src/arch/mlx_stream_stub.zig b/src/arch/mlx_stream_stub.zig
+index fbc9b34..01f1ec7 100644
+--- a/src/arch/mlx_stream_stub.zig
++++ b/src/arch/mlx_stream_stub.zig
+@@ -5,6 +5,10 @@ const mlx = @import("../mlx.zig");
+ const ModelConfig = @import("../model.zig").ModelConfig;
+ 
+ pub const built = false;
++pub const VisionInput = struct { rows: mlx.mlx_array, offset: u64, key: [32]u8 };
++pub fn visionInput(_: ?mlx.mlx_array, _: []const u32, _: u32) !?VisionInput {
++    return null;
++}
+ 
+ pub fn setForeignBytes(_: u64) void {}
+ 
+@@ -36,7 +40,7 @@ pub fn open(_: std.mem.Allocator, _: std.Io, _: mlx.mlx_stream, config: *const M
+ }
+ 
+ pub fn close(_: *Model) void {}
+-pub fn begin(_: *Model, _: []const u32, _: u32, _: u64) !u64 {
++pub fn begin(_: *Model, _: []const u32, _: u32, _: u64, _: ?VisionInput) !u64 {
+     return 0;
+ }
+ pub fn end(_: *Model) void {}
+diff --git a/src/chat.zig b/src/chat.zig
+index 080b04c..2e222dd 100644
+--- a/src/chat.zig
++++ b/src/chat.zig
+@@ -169,6 +169,8 @@ pub const ChatConfig = struct {
+     /// A template that reads `content` as a STRING (DeepSeek-V4.1): each attached image becomes this
+     /// atom, joined to the text by blank lines, the way the release's encoder renders image blocks.
+     image_placeholder: ?[]const u8 = null,
++    /// DeepSeek orders tool results by the preceding assistant call IDs.
++    dsv41_order_tools: bool = false,
+ 
+     pub fn deinit(self: *ChatConfig) void {
+         self.allocator.free(self.chat_template);
+@@ -252,7 +254,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+     // not be served at all.
+     const a = std.testing.allocator;
+ 
+-    {   // the shape that panicked: pick the entry named "default"
++    { // the shape that panicked: pick the entry named "default"
+         const json =
+             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
+             \\{"name":"default","template":"PLAIN"}]}
+@@ -261,7 +263,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+         defer p.deinit();
+         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+     }
+-    {   // no "default" named: fall back to the first usable entry
++    { // no "default" named: fall back to the first usable entry
+         const json =
+             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+         ;
+@@ -269,7 +271,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+         defer p.deinit();
+         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+     }
+-    {   // the ordinary string shape is untouched
++    { // the ordinary string shape is untouched
+         const json =
+             \\{"chat_template":"BARE"}
+         ;
+@@ -277,7 +279,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+         defer p.deinit();
+         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+     }
+-    {   // junk shapes return null so the caller uses its jinja/family fallback
++    { // junk shapes return null so the caller uses its jinja/family fallback
+         const json =
+             \\{"chat_template":[{"name":"x"},{"nope":1}]}
+         ;
+@@ -287,7 +289,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+     }
+     try std.testing.expect(chatTemplateFromValue(null) == null);
+ 
+-    {   // transformers >= 5 saves the template to chat_template.jinja and leaves
++    { // transformers >= 5 saves the template to chat_template.jinja and leaves
+         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
+         // Laguna-S-2.1-oQ4e-fast, issue #169). jinja.cpp has no `include`, so
+         // taking the pointer literally fails the render and SILENTLY drops to
+@@ -300,7 +302,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+         defer p.deinit();
+         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
+     }
+-    {   // whitespace/dash variants are the same pointer
++    { // whitespace/dash variants are the same pointer
+         const json =
+             \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+         ;
+@@ -308,7 +310,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
+         defer p.deinit();
+         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
+     }
+-    {   // a real template that merely CONTAINS the word include is untouched
++    { // a real template that merely CONTAINS the word include is untouched
+         const json =
+             \\{"chat_template":"{% if x %}include{% endif %}"}
+         ;
+@@ -395,6 +397,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
+         .allocator = allocator,
+         .renders_tool_turn = renders_tool_turn,
+         .image_placeholder = if (dsv41) "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>" else null,
++        .dsv41_order_tools = dsv41,
+     };
+ }
+ 
+@@ -637,8 +640,12 @@ test "RADIO video placeholders: literal HTML stays text in every role" {
+     defer tok.deinit();
+     const config = ChatConfig{
+         .chat_template = "{% for m in messages %}{{ m.role + ':' }}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
+-        .bos_token = null, .eos_token = null, .add_bos_token = false,
+-        .allocator = a, .renders_tool_turn = true, .video_placeholder = "<img>",
++        .bos_token = null,
++        .eos_token = null,
++        .add_bos_token = false,
++        .allocator = a,
++        .renders_tool_turn = true,
++        .video_placeholder = "<img>",
+     };
+     for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
+         const messages = [_]Message{.{ .role = role, .content = "How do I autoplay a <video> element?" }};
+@@ -657,7 +664,11 @@ test "RADIO video placeholders: only attached clips create video atoms" {
+     defer tok.deinit();
+     const config = ChatConfig{
+         .chat_template = "{% for m in messages %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}",
+-        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .video_placeholder = "<img>",
++        .bos_token = null,
++        .eos_token = null,
++        .add_bos_token = false,
++        .allocator = a,
++        .video_placeholder = "<img>",
+     };
+     const clips = [_]VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
+     const images = [_]ImageData{.{ .pixels = "", .width = 32, .height = 32 }};
+@@ -1165,7 +1176,55 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
+ }
+ 
+ pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
+-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder, chat_config.image_placeholder);
++    const ordered = if (chat_config.dsv41_order_tools) try orderDsv41ToolMessages(allocator, messages) else null;
++    defer if (ordered) |m| allocator.free(m);
++    return serializeMessagesJsonImpl(allocator, ordered orelse messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder, chat_config.image_placeholder);
++}
++
++fn dsv41ToolRank(message: Message, calls: []const ToolCall) usize {
++    const id = message.tool_call_id orelse return 0;
++    for (calls, 0..) |call, rank| if (std.mem.eql(u8, id, call.id)) return rank;
++    return 0;
++}
++
++/// Sort only tool-result slots within each merged user-side group, preserving text/image positions.
++fn orderDsv41ToolMessages(allocator: std.mem.Allocator, messages: []const Message) ![]Message {
++    const out = try allocator.dupe(Message, messages);
++    errdefer allocator.free(out);
++    const positions = try allocator.alloc(usize, messages.len);
++    defer allocator.free(positions);
++    var calls: []const ToolCall = &.{};
++    var at: usize = 0;
++    while (at < out.len) {
++        const msg = out[at];
++        if (std.mem.eql(u8, msg.role, "assistant")) {
++            if (msg.tool_calls) |tc| if (tc.len > 0) {
++                calls = tc;
++            };
++            at += 1;
++            continue;
++        }
++        if (!std.mem.eql(u8, msg.role, "user") and !std.mem.eql(u8, msg.role, "tool")) {
++            at += 1;
++            continue;
++        }
++        var count: usize = 0;
++        while (at < out.len and (std.mem.eql(u8, out[at].role, "user") or std.mem.eql(u8, out[at].role, "tool"))) : (at += 1) {
++            if (std.mem.eql(u8, out[at].role, "tool")) {
++                positions[count] = at;
++                count += 1;
++            }
++        }
++        if (calls.len == 0) continue;
++        var k: usize = 1;
++        while (k < count) : (k += 1) {
++            const item = out[positions[k]];
++            var j = k;
++            while (j > 0 and dsv41ToolRank(out[positions[j - 1]], calls) > dsv41ToolRank(item, calls)) : (j -= 1) out[positions[j]] = out[positions[j - 1]];
++            out[positions[j]] = item;
++        }
++    }
++    return out;
+ }
+ 
+ pub fn messageHasMedia(msg: Message) bool {
+@@ -2822,7 +2881,7 @@ fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commi
+     {
+         return " to=user<|message|>";
+     }
+-    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
++    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64..], "\n\r\t ");
+     if (k2ThinkOpenerAt(tail)) |opener| {
+         inline for (k2_think_openers) |o| {
+             if (std.mem.eql(u8, opener, o)) return "</" ++ o[1..];
+@@ -3239,9 +3298,9 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
+     // of these into a real tool open. Order doesn't matter; first endsWith
+     // hit wins. Listed shortest-first for legibility.
+     const tail_prefixes = [_][]const u8{
+-        "<",     "<t",     "<to",     "<too",     "<tool",
+-        "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
+-        "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
++        "<",        "<t",        "<to",       "<too",       "<tool",
++        "<|",       "<|t",       "<|to",      "<|too",      "<|tool",
++        "<|tool_",  "<|tool_c",  "<|tool_ca", "<|tool_cal",
+         // MiniCPM5 V3 `<function name="…">` — COMPLETE ladder. `<funct` is a
+         // real decomposition in this vocabulary (`<f` id 54303 + `unct` id
+         // 14185 decode to exactly `<funct`); omitting that one rung flushed the
+@@ -4954,7 +5013,7 @@ fn parseSelfClosingToolTag(slice: []const u8) ?struct { name: []const u8, argume
+         var w: usize = k + 1;
+         while (w < slice.len and (slice[w] == ' ' or slice[w] == '\t' or slice[w] == '\n' or slice[w] == '\r')) w += 1;
+         const close_markers = [_][]const u8{
+-            "</tool_call>",   "</tool_calls>",
++            "</tool_call>",    "</tool_calls>",
+             "</tool_request>", "</tool_requests>",
+             "</tool>",
+         };
+@@ -11926,7 +11985,7 @@ test "parseToolCalls: <tool_call>{JSON} truncated before </tool_call>" {
+     const allocator = testing.allocator;
+     const text = "\n\n<tool_call>\n" ++
+         \\{"name": "writeFile", "arguments": {"path": "vite.config.js", "content": "ok"}}
+-        ++ "\n</tool_cal";
++    ++ "\n</tool_cal";
+     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+     defer {
+         for (calls) |tc| {
+@@ -11949,7 +12008,7 @@ test "parseToolCalls: mismatched </tool_action> close still parses" {
+     const allocator = testing.allocator;
+     const text = "<tool_call>\n" ++
+         \\{"name": "edit", "arguments": {"path":"mlx.html", "edits":[{"oldText": "  </ul>\n</body>", "newText": "  </ul>\n  <button onclick=\"alert('Hello from MLX')\">Click me</button>\n</body>"}]}
+-        ++ "\n</tool_action>";
++    ++ "\n</tool_action>";
+     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+     defer {
+         for (calls) |tc| {
+@@ -12410,9 +12469,9 @@ fn jsonValueEql(a: std.json.Value, b: std.json.Value) bool {
+ /// Value strings chosen to collide with every JSON literal spelling the
+ /// tag-format parsers used to guess from.
+ const adversarial_strings = [_][]const u8{
+-    "false",      "true",         "False",   "True",    "null",   "None",
+-    "42",         "-7",           "3.14",    "0",       "1",      "",
+-    "[1,2]",      "{\"k\":1}",    "nan",     "inf",     "  ",     "yes",
++    "false", "true",       "False",     "True",        "null", "None",
++    "42",    "-7",         "3.14",      "0",           "1",    "",
++    "[1,2]", "{\"k\":1}",  "nan",       "inf",         "  ",   "yes",
+     "a\"b",  "line\nline", "tab\there", "back\\slash",
+     "café ☕",
+     "0x1f",  "{not json",  "[unclosed", "1e400",       "00",   "+5",
+@@ -15952,3 +16011,31 @@ test "a sampled special token where <function='s `<` belongs still names the cal
+     try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<function=x>\n</function>")) == null);
+     try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<|im_start|>\nfunction=x>")) == null);
+ }
++
++test "dsv41 1017: host tool ordering and thinking headers match the official encoder" {
++    var arena = std.heap.ArenaAllocator.init(testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const cases = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/dsv41_1017_template_cases.json"), .{});
++    for (cases.array.items) |case| {
++        const o = case.object;
++        var messages: std.ArrayList(Message) = .empty;
++        for (o.get("messages").?.array.items) |message| {
++            const m = message.object;
++            var calls: std.ArrayList(ToolCall) = .empty;
++            if (m.get("tool_calls")) |tc| for (tc.array.items) |call| {
++                const f = call.object.get("function").?.object;
++                try calls.append(a, .{ .id = call.object.get("id").?.string, .name = f.get("name").?.string, .arguments = try std.json.Stringify.valueAlloc(a, f.get("arguments").?, .{}) });
++            };
++            try messages.append(a, .{ .role = m.get("role").?.string, .content = m.get("content").?.string, .tool_calls = if (calls.items.len > 0) calls.items else null, .tool_call_id = if (m.get("tool_call_id")) |id| id.string else null, .reasoning_content = if (m.get("reasoning_content")) |v| v.string else null });
++        }
++        const config: ChatConfig = .{ .allocator = a, .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .dsv41_order_tools = true };
++        const tools = if (o.get("tools").? == .null) null else try std.json.Stringify.valueAlloc(a, o.get("tools").?, .{});
++        const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"{s}\"}}", .{ o.get("thinking_mode").?.string, o.get("reasoning_effort").?.string });
++        const got = (try renderJinja(a, messages.items, &config, tools, extra, .null_literal)) orelse return error.RenderFailed;
++        testing.expectEqualStrings(o.get("expected").?.string, got) catch |e| {
++            std.debug.print("case: {s}\n", .{o.get("label").?.string});
++            return e;
++        };
++    }
++}
+diff --git a/src/experiment_stream_rows.zig b/src/experiment_stream_rows.zig
+new file mode 100644
+index 0000000..2d7bcca
+--- /dev/null
++++ b/src/experiment_stream_rows.zig
+@@ -0,0 +1,35 @@
++//! Process-local row override for controlled, isolated benchmarks.
++//! Admission and the plugin's complete 256K memory bill remain authoritative.
++const std = @import("std");
++
++pub const Rows = struct { decode: u32, prefill: u32 };
++
++pub fn parse(decode: ?[]const u8, prefill: ?[]const u8) !?Rows {
++    if (decode == null and prefill == null) return null;
++    const d = try integer(decode orelse return error.InvalidExperimentalExpertRows);
++    const p = try integer(prefill orelse return error.InvalidExperimentalExpertRows);
++    if (p < 16 or p > d or d > 384) return error.InvalidExperimentalExpertRows;
++    return .{ .decode = d, .prefill = p };
++}
++
++fn integer(s: []const u8) !u32 {
++    if (s.len == 0) return error.InvalidExperimentalExpertRows;
++    for (s) |c| if (c < '0' or c > '9') return error.InvalidExperimentalExpertRows;
++    return std.fmt.parseInt(u32, s, 10) catch error.InvalidExperimentalExpertRows;
++}
++
++test "experiment rows: absent preserves the upstream planner and valid paired rows stay exact" {
++    try std.testing.expectEqual(@as(?Rows, null), try parse(null, null));
++    try std.testing.expectEqual(Rows{ .decode = 132, .prefill = 86 }, (try parse("132", "86")).?);
++    try std.testing.expectEqual(Rows{ .decode = 16, .prefill = 16 }, (try parse("16", "16")).?);
++    try std.testing.expectEqual(Rows{ .decode = 384, .prefill = 384 }, (try parse("384", "384")).?);
++}
++
++test "experiment rows: incomplete, invalid or out-of-range input refuses instead of silently replanning" {
++    for ([_][2]?[]const u8{
++        .{ "132", null },  .{ null, "86" },    .{ "", "86" },           .{ "132", "" },
++        .{ "abc", "86" },  .{ "132.0", "86" }, .{ "-1", "86" },         .{ "+132", "86" },
++        .{ "132 ", "86" }, .{ " 132", "86" },  .{ "132", "0" },         .{ "132", "15" },
++        .{ "85", "86" },   .{ "385", "86" },   .{ "4294967296", "86" },
++    }) |pair| try std.testing.expectError(error.InvalidExperimentalExpertRows, parse(pair[0], pair[1]));
++}
+diff --git a/src/fixtures/dsv41_1017_template_cases.json b/src/fixtures/dsv41_1017_template_cases.json
+new file mode 100644
+index 0000000..1abf65f
+--- /dev/null
++++ b/src/fixtures/dsv41_1017_template_cases.json
+@@ -0,0 +1,517 @@
++[
++ {
++  "label": "simple/chat",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "chat",
++  "reasoning_effort": "low",
++  "expected": "<｜begin▁of▁sentence｜><｜User｜>Weather in Paris?<｜Assistant｜></think>"
++ },
++ {
++  "label": "simple/thinking low",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "thinking",
++  "reasoning_effort": "low",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
++ },
++ {
++  "label": "simple/thinking high",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
++ },
++ {
++  "label": "simple/thinking max",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "thinking",
++  "reasoning_effort": "max",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
++ },
++ {
++  "label": "system+tools/chat",
++  "messages": [
++   {
++    "role": "system",
++    "content": "You are helpful."
++   },
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "chat",
++  "reasoning_effort": "low",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>You are helpful.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris?<｜Assistant｜></think>"
++ },
++ {
++  "label": "system+tools/thinking",
++  "messages": [
++   {
++    "role": "system",
++    "content": "You are helpful."
++   },
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are helpful.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
++ },
++ {
++  "label": "tools, no system/thinking",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris?<｜Assistant｜><think>"
++ },
++ {
++  "label": "tool round/chat",
++  "messages": [
++   {
++    "role": "system",
++    "content": "You are helpful."
++   },
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   },
++   {
++    "role": "assistant",
++    "content": "",
++    "reasoning_content": "Need the tool.",
++    "tool_calls": [
++     {
++      "id": "tc_0",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Paris",
++        "days": 3
++       }
++      }
++     }
++    ]
++   },
++   {
++    "role": "tool",
++    "content": "Sunny, 22C",
++    "tool_call_id": "tc_0"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "chat",
++  "reasoning_effort": "low",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>You are helpful.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris?<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny, 22C</tool_result><｜Assistant｜></think>"
++ },
++ {
++  "label": "tool round/thinking",
++  "messages": [
++   {
++    "role": "system",
++    "content": "You are helpful."
++   },
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   },
++   {
++    "role": "assistant",
++    "content": "",
++    "reasoning_content": "Need the tool.",
++    "tool_calls": [
++     {
++      "id": "tc_0",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Paris",
++        "days": 3
++       }
++      }
++     }
++    ]
++   },
++   {
++    "role": "tool",
++    "content": "Sunny, 22C",
++    "tool_call_id": "tc_0"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are helpful.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris?<｜Assistant｜><think>Need the tool.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny, 22C</tool_result><｜Assistant｜><think>"
++ },
++ {
++  "label": "history drops thinking/thinking",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Why is the sky blue?"
++   },
++   {
++    "role": "assistant",
++    "content": "Rayleigh scattering.",
++    "reasoning_content": "Shorter wavelengths scatter more."
++   },
++   {
++    "role": "user",
++    "content": "And sunsets?"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Why is the sky blue?<｜Assistant｜></think>Rayleigh scattering.<｜end▁of▁sentence｜><｜User｜>And sunsets?<｜Assistant｜><think>"
++ },
++ {
++  "label": "history/chat",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Why is the sky blue?"
++   },
++   {
++    "role": "assistant",
++    "content": "Rayleigh scattering.",
++    "reasoning_content": "Shorter wavelengths scatter more."
++   },
++   {
++    "role": "user",
++    "content": "And sunsets?"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "chat",
++  "reasoning_effort": "low",
++  "expected": "<｜begin▁of▁sentence｜><｜User｜>Why is the sky blue?<｜Assistant｜></think>Rayleigh scattering.<｜end▁of▁sentence｜><｜User｜>And sunsets?<｜Assistant｜></think>"
++ },
++ {
++  "label": "parallel calls/thinking",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris and Rome?"
++   },
++   {
++    "role": "assistant",
++    "content": "",
++    "tool_calls": [
++     {
++      "id": "a",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Paris"
++       }
++      }
++     },
++     {
++      "id": "b",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Rome"
++       }
++      }
++     }
++    ]
++   },
++   {
++    "role": "tool",
++    "content": "Paris: sunny, 22C",
++    "tool_call_id": "a"
++   },
++   {
++    "role": "tool",
++    "content": "Rome: cloudy, 19C",
++    "tool_call_id": "b"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris and Rome?<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Paris: sunny, 22C</tool_result>\n\n<tool_result>Rome: cloudy, 19C</tool_result><｜Assistant｜><think>"
++ },
++ {
++  "label": "parallel replies reversed/thinking",
++  "messages": [
++   {
++    "role": "user",
++    "content": "Weather in Paris and Rome?"
++   },
++   {
++    "role": "assistant",
++    "content": "",
++    "tool_calls": [
++     {
++      "id": "a",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Paris"
++       }
++      }
++     },
++     {
++      "id": "b",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Rome"
++       }
++      }
++     }
++    ]
++   },
++   {
++    "role": "tool",
++    "content": "Rome: cloudy, 19C",
++    "tool_call_id": "b"
++   },
++   {
++    "role": "tool",
++    "content": "Paris: sunny, 22C",
++    "tool_call_id": "a"
++   }
++  ],
++  "tools": [
++   {
++    "type": "function",
++    "function": {
++     "name": "get_weather",
++     "description": "Get weather",
++     "parameters": {
++      "type": "object",
++      "properties": {
++       "city": {
++        "type": "string"
++       },
++       "days": {
++        "type": "integer"
++       }
++      },
++      "required": [
++       "city"
++      ]
++     }
++    }
++   }
++  ],
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris and Rome?<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Paris: sunny, 22C</tool_result>\n\n<tool_result>Rome: cloudy, 19C</tool_result><｜Assistant｜><think>"
++ },
++ {
++  "label": "tool-only continuation without schemas",
++  "messages": [
++   {
++    "role": "system",
++    "content": "You are helpful."
++   },
++   {
++    "role": "user",
++    "content": "Weather in Paris?"
++   },
++   {
++    "role": "assistant",
++    "content": "",
++    "reasoning_content": "Need the tool.",
++    "tool_calls": [
++     {
++      "id": "tc_0",
++      "type": "function",
++      "function": {
++       "name": "get_weather",
++       "arguments": {
++        "city": "Paris",
++        "days": 3
++       }
++      }
++     }
++    ]
++   },
++   {
++    "role": "tool",
++    "content": "Sunny, 22C",
++    "tool_call_id": "tc_0"
++   }
++  ],
++  "tools": null,
++  "thinking_mode": "thinking",
++  "reasoning_effort": "high",
++  "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are helpful.<｜User｜>Weather in Paris?<｜Assistant｜><think>Need the tool.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>Sunny, 22C</tool_result><｜Assistant｜><think>"
++ }
++]
+diff --git a/src/fixtures/dsv41_chat_template.jinja b/src/fixtures/dsv41_chat_template.jinja
+index 12f15c3..98833f8 100644
+--- a/src/fixtures/dsv41_chat_template.jinja
++++ b/src/fixtures/dsv41_chat_template.jinja
+@@ -15,7 +15,7 @@
+ {#- A late system turn counts as a user turn; tools anywhere keep every thought. -#}
+ {%- set st = namespace(last_user=-1, prev='') -%}
+ {%- for m in messages -%}
+-{%- if m['role'] == 'user' or m['role'] == 'tool' or (m['role'] == 'system' and not loop.first) -%}
++{%- if m['role'] == 'user' or (m['role'] == 'system' and not loop.first) -%}
+ {%- set st.last_user = loop.index0 -%}
+ {%- endif -%}
+ {%- endfor -%}
+diff --git a/src/model.zig b/src/model.zig
+index 793693a..efa1b10 100644
+--- a/src/model.zig
++++ b/src/model.zig
+@@ -747,6 +747,7 @@ pub const ModelConfig = struct {
+     // DeepSeek-V4.1 vision tower (src/dsv41_vision.zig): the release's `vision_config`, on top of the
+     // generic vision_* geometry. `dv_max_wh_ratio` 0 = no cap (the release's null).
+     dsv41_vision: bool = false,
++    dsv41_vision_load: ?bool = null,
+     dv_downsample: u32 = 3,
+     dv_max_image_tokens: u32 = 1024,
+     dv_min_pixels: u32 = 295936,
+@@ -4828,9 +4829,9 @@ fn parseQwenAudioConfig(root: std.json.ObjectMap) !QwenAudioConfig {
+     const ac = jsonField(root, "audio_config") orelse return qa;
+     const o = try jsonValue(.object, ac);
+     inline for (.{
+-        .{ "d_model", "d_model" },             .{ "encoder_layers", "layers" },     .{ "encoder_attention_heads", "heads" },
+-        .{ "encoder_ffn_dim", "ffn" },         .{ "num_mel_bins", "mel_bins" },     .{ "downsample_hidden_size", "downsample" },
+-        .{ "n_window", "n_window" },           .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
++        .{ "d_model", "d_model" },     .{ "encoder_layers", "layers" },         .{ "encoder_attention_heads", "heads" },
++        .{ "encoder_ffn_dim", "ffn" }, .{ "num_mel_bins", "mel_bins" },         .{ "downsample_hidden_size", "downsample" },
++        .{ "n_window", "n_window" },   .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
+     }) |kv| {
+         if (jsonField(o, kv[0])) |v| @field(qa, kv[1]) = try jsonU32(v);
+     }
+@@ -5089,7 +5090,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const
+ /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
+ /// RAM size would have them compressed under the file cache.
+ /// `index_owners`: a tensor two shards carry loads from the shard the index names.
+-pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
++pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, dsv41_vision_only: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+ 
+ pub const Owners = std.StringHashMapUnmanaged([]const u8);
+ 
+@@ -5212,7 +5213,13 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
+ 
+ /// The text model's weights for `config`.
+ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
+-    if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
++    if (config.mlxStream()) {
++        if (config.dsv41_stream) {
++            config.dsv41_vision_load = load_vision and config.dsv41_vision;
++            if (config.dsv41_vision_load.?) return loadDsv41VisionWeights(io, allocator, model_dir);
++        }
++        return Weights.init(allocator);
++    }
+     try admitExl3Backend(config, mlx.metalKernelsAvailable());
+     var gguf_weights = Weights.init(allocator);
+     errdefer gguf_weights.deinit();
+@@ -5260,6 +5267,33 @@ pub fn dsv41VisionKey(key: []const u8) bool {
+     return std.mem.startsWith(u8, key, "vision.") or std.mem.startsWith(u8, key, "aligner.") or std.mem.startsWith(u8, key, "image_");
+ }
+ 
++/// Load only the shards containing tower/aligner/image delimiter tensors. Text arrays in a
++/// shared shard are discarded while still lazy, before casts or evaluation.
++fn loadDsv41VisionWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
++    var arena = std.heap.ArenaAllocator.init(allocator);
++    defer arena.deinit();
++    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
++    defer dir.close(io);
++    var owners = indexOwners(io, arena.allocator(), dir) orelse return error.MissingVisionWeightIndex;
++    var shards: std.StringHashMapUnmanaged(void) = .empty;
++    var it = owners.iterator();
++    while (it.next()) |entry| {
++        if (dsv41VisionKey(entry.key_ptr.*)) try shards.put(arena.allocator(), entry.value_ptr.*, {});
++    }
++    if (shards.count() == 0) return error.MissingVisionWeights;
++    var weights = Weights.init(allocator);
++    errdefer weights.deinit();
++    const s = mlx.mlx_default_cpu_stream_new();
++    defer _ = mlx.mlx_stream_free(s);
++    var si = shards.keyIterator();
++    while (si.next()) |shard| {
++        const path = try std.fmt.allocPrintSentinel(arena.allocator(), "{s}/{s}", .{ model_dir, shard.* }, 0);
++        try loadSafetensorsFile(allocator, &weights, path, s, .{ .vision = true, .dsv41_vision_only = true, .owners = &owners, .shard = shard.* });
++    }
++    log.info("[vision] loaded {d} DeepSeek encoder tensors from {d} shards\n", .{ weights.count(), shards.count() });
++    return weights;
++}
++
+ /// The repack keeps the Engram projections beside its tables, under `engram/`.
+ fn loadDsv41Residents(io: std.Io, allocator: std.mem.Allocator, weights: *Weights, model_dir: []const u8) !void {
+     const path = try std.fmt.allocPrintSentinel(allocator, "{s}/engram/engram-residents.safetensors", .{model_dir}, 0);
+@@ -5565,7 +5599,7 @@ pub fn loadSafetensorsFile(
+         const key_str = std.mem.span(key.?);
+ 
+         const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
+-        if (foreign or !keepsTensor(key_str, opts) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
++        if ((opts.dsv41_vision_only and !dsv41VisionKey(key_str)) or foreign or !keepsTensor(key_str, opts) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
+             (opts.dsv41 and dsv41DropsKey(key_str, opts.vision)))
+         {
+             _ = mlx.mlx_array_free(value);
+diff --git a/src/model_registry.zig b/src/model_registry.zig
+index da1f791..59f1a41 100644
+--- a/src/model_registry.zig
++++ b/src/model_registry.zig
+@@ -312,6 +312,8 @@ pub const LoadedModel = struct {
+     /// Resident GPU bytes for this entry (weights + vision + drafter),
+     /// summed at load time. Zero for non-`.ready` entries.
+     bytes_resident: u64,
++    /// Last served request capacity, retained while a reload replaces the CPU config.
++    advertised_context: u32 = 0,
+     /// Estimated bytes reserved against `ModelRegistry.reserved_bytes` while
+     /// this entry is mid-load (`.loading`). Lets concurrent loaders see this
+     /// pending allocation in the budget gate so two loads can't both pass and
+diff --git a/src/model_settings.zig b/src/model_settings.zig
+index c22c038..20e105f 100644
+--- a/src/model_settings.zig
++++ b/src/model_settings.zig
+@@ -213,10 +213,33 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
+     };
+ }
+ 
++/// A process-local settings file for isolated service experiments. An invalid
++/// explicit path disables settings rather than falling back to a global file.
++pub fn selectedPath(buf: []u8, explicit: ?[]const u8, fallback: []const u8) []const u8 {
++    if (explicit) |path| {
++        if (!std.fs.path.isAbsolute(path) or path.len >= buf.len) return "";
++        @memcpy(buf[0..path.len], path);
++        return buf[0..path.len];
++    }
++    return fallback;
++}
++
+ pub fn defaultPath(buf: []u8) []const u8 {
++    if (std.c.getenv("MLX_SERVE_MODEL_SETTINGS_PATH")) |value|
++        return selectedPath(buf, std.mem.span(value), "");
+     return homeFile(buf, "model-settings.json");
+ }
+ 
++test "model_settings: process-local override never falls back to global settings" {
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("/project/state/settings.json", selectedPath(&buf, "/project/state/settings.json", "global"));
++    try std.testing.expectEqualStrings("", selectedPath(&buf, "relative.json", "global"));
++    try std.testing.expectEqualStrings("", selectedPath(&buf, "", "global"));
++    try std.testing.expectEqualStrings("global", selectedPath(&buf, null, "global"));
++    var small: [4]u8 = undefined;
++    try std.testing.expectEqualStrings("", selectedPath(&small, "/long/path", "global"));
++}
++
+ /// `~/.mlx-serve/<name>`; "" when it does not fit `buf`.
+ pub fn homeFile(buf: []u8, name: []const u8) []const u8 {
+     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+diff --git a/src/plugin_profile_host.zig b/src/plugin_profile_host.zig
+new file mode 100644
+index 0000000..7d67b5f
+--- /dev/null
++++ b/src/plugin_profile_host.zig
+@@ -0,0 +1,9 @@
++//! Profile-enabled plugin tests use the served feature gate and the scripted I/O faults together.
++const surface = @import("plugin_host.zig");
++pub const mlx = surface.mlx;
++pub const log = surface.log;
++pub const io_util = surface.io_util;
++pub const mtp_acceptance = surface.mtp_acceptance;
++pub const sushi_exl3 = surface.sushi_exl3;
++pub const dsa_nax = surface.dsa_nax;
++pub const plugin_profile: bool = @import("plugin_test_options").enabled;
+diff --git a/src/scheduler.zig b/src/scheduler.zig
+index 11de22b..9095e1c 100644
+--- a/src/scheduler.zig
++++ b/src/scheduler.zig
+@@ -8431,7 +8431,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+     const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
+         try dsv41_mod.resumePrompt(mdl, slot.full_prompt, slot.vision_embeddings)
+     else if (xfm_ptr.mlx_stream_ext) |m|
+-        try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
++        try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config), if (xfm_ptr.config.dsv41_stream) try mlx_stream.visionInput(slot.vision_embeddings, slot.full_prompt, xfm_ptr.config.image_token_id) else null)
+     else
+         0;
+     if (resumed > 0) {
+diff --git a/src/server.zig b/src/server.zig
+index c7a0130..16103e8 100644
+--- a/src/server.zig
++++ b/src/server.zig
+@@ -2146,7 +2146,6 @@ pub fn serve(
+         std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
+     }
+ 
+-
+     // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
+     //    every serve path (model/headless/gen/ds4/llama) flows through — so the
+     //    advertised port is always the bound port. Bonjour being unavailable
+@@ -7200,8 +7199,8 @@ fn isStatusRoute(method: []const u8, path: []const u8) bool {
+ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
+     if (std.mem.eql(u8, method, "POST")) {
+         const routes = [_][]const u8{
+-            "/v1/chat/completions", "/v1/completions", "/v1/messages",
+-            "/v1/responses",        "/api/chat",       "/api/generate",
++            "/v1/chat/completions",     "/v1/completions", "/v1/messages",
++            "/v1/responses",            "/api/chat",       "/api/generate",
+             "/v1/audio/transcriptions",
+         };
+         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
+@@ -7217,6 +7216,21 @@ fn loadedSupportsVideo(entry: *const LoadedModel, config: *const model_mod.Model
+     return ve.supportsImages() and config.video_token_id != 0;
+ }
+ 
++/// Called under the registry lock; loading may replace the retained config.
++fn advertisedModelContext(entry: *LoadedModel, fallback: u32) u32 {
++    if (entry.state != .loading) if (entry.config) |config| {
++        const served = getEffectiveContextLength(config);
++        if (served > 0) {
++            entry.advertised_context = served;
++            return served;
++        }
++    };
++    if (entry.advertised_context > 0) return entry.advertised_context;
++    const undiscovered: model_mod.ModelConfig = .{ .model_type = entry.arch_hint };
++    const requested = manualContext(&undiscovered);
++    return if (requested > 0) @min(requested, fallback) else fallback;
++}
++
+ /// pulls full capabilities/dimensions off the resident config/chat_config;
+ /// for non-ready entries renders a lightweight stub with state +
+ /// bytes_on_disk only. Returns an allocator-owned string; caller frees.
+@@ -7231,7 +7245,7 @@ fn renderModelEntry(
+     if (entry.state == .ready and entry.config != null and entry.chat_config != null) {
+         const config = entry.config.?;
+         const chat_config = entry.chat_config.?;
+-        const ctx_len = getEffectiveContextLength(config);
++        const ctx_len = advertisedModelContext(entry, config.max_position_embeddings);
+         const ctx_str = if (ctx_len > 0)
+             try std.fmt.allocPrint(allocator, "{d}", .{ctx_len})
+         else
+@@ -7379,6 +7393,8 @@ fn renderModelEntry(
+     // faulting in weights: dims, context window, MoE-ness, and capabilities.
+     // `/v1/models` isn't hot, so reading a small JSON per unloaded entry is fine.
+     const sm = model_discovery.readStubMeta(io, allocator, entry.path);
++    const served_context = advertisedModelContext(entry, sm.max_position_embeddings);
++    const stub_has_vision = sm.has_vision and !scheduler_mod.no_vision_global;
+ 
+     // Capabilities. Encoder-only models advertise "embeddings"; chat models get
+     // chat/tool_use/streaming/json_schema (gated on chat-template presence, the
+@@ -7435,16 +7451,16 @@ fn renderModelEntry(
+             try add(allocator, &b, &n, "streaming");
+             try add(allocator, &b, &n, "json_schema");
+         }
+-        if (sm.has_vision) try add(allocator, &b, &n, "vision");
++        if (stub_has_vision) try add(allocator, &b, &n, "vision");
+         if (stub_has_embedding) try add(allocator, &b, &n, "embeddings");
+         try b.append(allocator, ']');
+         break :blk try b.toOwnedSlice(allocator);
+     };
+     defer allocator.free(caps_part);
+ 
+-    const mods_part: []const u8 = if (sm.found and sm.has_vision and sm.has_video)
++    const mods_part: []const u8 = if (sm.found and stub_has_vision and sm.has_video)
+         ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
+-    else if (sm.found and sm.has_vision)
++    else if (sm.found and stub_has_vision)
+         ",\"input_modalities\":[\"text\",\"image\"]"
+     else if ((sm.found and sm.has_chat) or is_gguf_stub)
+         ",\"input_modalities\":[\"text\"]"
+@@ -7467,12 +7483,12 @@ fn renderModelEntry(
+     defer allocator.free(engine_part);
+ 
+     // Top-level twins of meta.context_length (issue #188): openai-models-list
+-    // discovery clients read row-level max_model_len/context_length. Unloaded
+-    // stubs advertise the architectural max — the same number meta carries here.
++    // discovery clients read row-level max_model_len/context_length. The served
++    // capacity survives eviction; model_max_tokens remains the architectural limit.
+     const top_ctx_part: []const u8 = if (sm.found) blk: {
+         break :blk try std.fmt.allocPrint(allocator, ",\"context_length\":{d},\"max_model_len\":{d}", .{
+-            sm.max_position_embeddings,
+-            sm.max_position_embeddings,
++            served_context,
++            served_context,
+         });
+     } else &[_]u8{};
+     defer if (top_ctx_part.len > 0) allocator.free(top_ctx_part);
+@@ -7484,7 +7500,7 @@ fn renderModelEntry(
+             sm.hidden_size,
+             sm.num_hidden_layers,
+             quantizationJson(&quant_buf, sm.quant_bits),
+-            sm.max_position_embeddings,
++            served_context,
+             sm.max_position_embeddings,
+             if (sm.is_moe) "true" else "false",
+             if (sm.has_mtp) "true" else "false",
+@@ -7677,8 +7693,9 @@ fn machineJson(allocator: std.mem.Allocator) ![]u8 {
+     var model_buf: [64]u8 = undefined;
+     const status_mod = @import("status.zig");
+     return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f},\"free_mib\":{d},\"total_mib\":{d}{s}}}", .{
+-        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}),
+-        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20, pair,
++        @tagName(builtin.os.tag),                std.json.fmt(machineModel(&model_buf), .{}),
++        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20,
++        pair,
+     });
+ }
+ 
+@@ -8643,15 +8660,14 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
+             st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
+         });
+     return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+-        build_options.version,                      st.engine,
+-        st.kv_quant,                                @tagName(st.kv_attn_mode),
+-        st.decode_attn_quant,                       st.prefill_chunk,
+-        mtp_json,
+-        st.drafter,                                 st.pld.enable,
+-        st.pld.draft_len,                           st.pld.key_len,
+-        st.max_concurrent,                          st.prefill_decode_share,
+-        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
+-        st.prefix_cache_disk_bytes,
++        build_options.version,     st.engine,
++        st.kv_quant,               @tagName(st.kv_attn_mode),
++        st.decode_attn_quant,      st.prefill_chunk,
++        mtp_json,                  st.drafter,
++        st.pld.enable,             st.pld.draft_len,
++        st.pld.key_len,            st.max_concurrent,
++        st.prefill_decode_share,   st.prefix_cache_ram_enabled,
++        st.prefix_cache_mem_bytes, st.prefix_cache_disk_bytes,
+     });
+ }
+ 
+@@ -9500,8 +9516,20 @@ fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request: ?Re
+ }
+ 
+ fn resolveChatThinking(root: std.json.ObjectMap, gen: generation_settings.Profile, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+-    const enable: ?bool = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
+-    return resolveThinking(gen, enable, parseReasoningEffort(root, default_budget, word_only), arch_default, default_budget, word_only);
++    const legacy: ?bool = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
++    const explicit_mode: ?bool = blk: {
++        const thinking = requestField(root, "thinking") orelse break :blk null;
++        if (thinking != .object) break :blk null;
++        const kind = thinking.object.get("type") orelse break :blk null;
++        if (kind != .string) break :blk null;
++        if (std.mem.eql(u8, kind.string, "disabled")) break :blk false;
++        if (std.mem.eql(u8, kind.string, "enabled")) break :blk true;
++        break :blk null;
++    };
++    // Preserve the legacy bool/effort contract. DeepSeek's disabled mode turns
++    // thinking off even when a client retains an effort selection beside it.
++    const effort = if (legacy == null and explicit_mode == false) null else parseReasoningEffort(root, default_budget, word_only);
++    return resolveThinking(gen, legacy orelse explicit_mode, effort, arch_default, default_budget, word_only);
+ }
+ 
+ const SchemaThinkingPolicy = enum {
+@@ -10285,6 +10313,10 @@ fn handleChatCompletions(
+         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+         return;
+     };
++    if (config.dsv41_stream) if (@import("vision_stream.zig").rejectReason(messages.items)) |reason| {
++        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
++        return;
++    };
+     if (lm.vision_encoder == null) {
+         if (mediaRejectReason(messages.items, continue_final)) |reason| {
+             log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{reason});
+@@ -14145,13 +14177,13 @@ fn loginPageHtml(comptime note: []const u8) []const u8 {
+     \\<h1>API key required</h1>
+     \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
+     \\
+-++ note ++
+-    \\<form method="post">
+-    \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
+-    \\<button type="submit">Continue</button>
+-    \\</form>
+-    \\</main></body></html>
+-    \\
++    ++ note ++
++        \\<form method="post">
++        \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
++        \\<button type="submit">Continue</button>
++        \\</form>
++        \\</main></body></html>
++        \\
+     ;
+ }
+ 
+@@ -14468,8 +14500,11 @@ test "input_modalities renders resident video weights and native unloaded capabi
+     var radio_config = try model_mod.parseConfigFromJson(a, native);
+     defer radio_config.deinit(a);
+     var chat_config = chat_mod.ChatConfig{
+-        .chat_template = "template", .bos_token = null, .eos_token = null,
+-        .add_bos_token = false, .allocator = a,
++        .chat_template = "template",
++        .bos_token = null,
++        .eos_token = null,
++        .add_bos_token = false,
++        .allocator = a,
+     };
+     var encoder = std.mem.zeroInit(vision_mod.VisionEncoder, .{ .allocator = a, .config = qwen_config });
+     var radio = std.mem.zeroInit(radio_vision.RadioVision, .{ .allocator = a });
+@@ -17674,6 +17709,10 @@ fn handleAnthropicMessages(
+     // endpoint has always given.
+     const continue_final = chat_mod.continuationRequested(messages.items) and
+         continuationRejectReason(lm.ds4_engine != null) == null;
++    if (config.dsv41_stream) if (@import("vision_stream.zig").rejectReason(messages.items)) |reason| {
++        try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
++        return;
++    };
+     if (lm.vision_encoder == null) {
+         if (mediaRejectReason(messages.items, continue_final)) |reason| {
+             log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});
+@@ -19499,6 +19538,10 @@ fn handleResponsesInner(
+         }
+     }
+ 
++    if (config.dsv41_stream) if (@import("vision_stream.zig").rejectReason(pi.messages.items)) |reason| {
++        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
++        return;
++    };
+     if (lm.vision_encoder == null) {
+         if (mediaRejectReason(pi.messages.items, false)) |reason| {
+             log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
+@@ -23520,14 +23563,24 @@ test "settingsPropsJson: native lane configuration is not generic MTP or request
+         .{ .enabled = false, .sampled = true, .stages = 0 },
+     }) |case| {
+         const frag = try settingsPropsJson(testing.allocator, .{
+-            .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto,
+-            .decode_attn_quant = false, .prefill_chunk = 8192,
+-            .mtp_loaded = case.stages > 0, .mtp_default_on = case.enabled,
+-            .mtp_acceptance = .exact, .mtp_greedy_tail = true, .mtp_depth = 6,
+-            .mtp_adaptive = true, .max_mtp_ctx = 0,
++            .engine = "mlx",
++            .kv_quant = "8",
++            .kv_attn_mode = .auto,
++            .decode_attn_quant = false,
++            .prefill_chunk = 8192,
++            .mtp_loaded = case.stages > 0,
++            .mtp_default_on = case.enabled,
++            .mtp_acceptance = .exact,
++            .mtp_greedy_tail = true,
++            .mtp_depth = 6,
++            .mtp_adaptive = true,
++            .max_mtp_ctx = 0,
+             .native_speculation = .{ .lane = "dspark typical 0.3", .block_size = case.stages, .sampled = case.sampled },
+-            .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1,
+-            .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0,
++            .drafter = "none",
++            .pld = PldDefaults.off,
++            .max_concurrent = 1,
++            .prefix_cache_mem_bytes = 0,
++            .prefix_cache_disk_bytes = 0,
+         });
+         defer testing.allocator.free(frag);
+         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
+@@ -25537,7 +25590,6 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
+     try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
+ }
+ 
+-
+ test "the chunk the guard BILLS is the chunk the forward will RUN" {
+     // Fatal-class drift: the bill is linear in the chunk, so a guard that
+     // models 512 while `generate` forwards 8192 admits a prefill that dies in
+@@ -25858,7 +25910,6 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
+     , with_details);
+ }
+ 
+-
+ test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
+     const a = testing.allocator;
+     for ([_]struct { prompt: u32, cached: u32, input: u32 }{
+@@ -28152,3 +28203,86 @@ test "proxiedBody: a Windows path id is spliced back escaped, so the forwarded b
+     defer a.free(out);
+     try std.testing.expectEqualStrings("{\"model\":\"C:\\\\m\"}", out);
+ }
++
++fn agentCompatEntry(a: std.mem.Allocator, path: []const u8) LoadedModel {
++    return model_registry_mod.LoadedModel{
++        .allocator = a,
++        .id = path,
++        .path = path,
++        .bytes_on_disk = null,
++        .arch_hint = "",
++        .config = null,
++        .weights = null,
++        .transformer = null,
++        .tokenizer = null,
++        .chat_config = null,
++        .vision_encoder = null,
++        .drafter = null,
++        .drafter_path = "",
++        .drafter_block_size = 0,
++        .prefix_cache = null,
++        .refcount = std.atomic.Value(u32).init(0),
++        .last_used_ns = 0,
++        .bytes_resident = 0,
++        .state = .unloaded,
++        .error_name = null,
++    };
++}
++
++test "agent compatibility: disabled thinking object and legacy precedence" {
++    const a = std.testing.allocator;
++    const cases = [_]struct { body: []const u8, arch: bool, want: bool }{
++        .{ .body = "{\"thinking\":{\"type\":\"disabled\"}}", .arch = true, .want = false },
++        .{ .body = "{\"thinking\":{\"type\":\"enabled\"}}", .arch = false, .want = true },
++        .{ .body = "{\"thinking\":{\"type\":\"disabled\"},\"reasoning_effort\":\"high\"}", .arch = true, .want = false },
++        .{ .body = "{\"enable_thinking\":true,\"thinking\":{\"type\":\"disabled\"}}", .arch = false, .want = true },
++        .{ .body = "{\"enable_thinking\":false,\"thinking\":{\"type\":\"enabled\"}}", .arch = true, .want = false },
++        .{ .body = "{\"enable_thinking\":false,\"reasoning_effort\":\"high\"}", .arch = false, .want = true },
++        .{ .body = "{\"chat_template_kwargs\":{\"thinking\":{\"type\":\"disabled\"}}}", .arch = true, .want = false },
++        .{ .body = "{\"thinking\":{\"type\":\"unknown\"}}", .arch = true, .want = true },
++    };
++    for (cases) |case| {
++        const doc = try std.json.parseFromSlice(std.json.Value, a, case.body, .{});
++        defer doc.deinit();
++        try std.testing.expectEqual(case.want, resolveChatThinking(doc.value.object, .{}, case.arch, -1, false).enable);
++    }
++    const off = try std.json.parseFromSlice(std.json.Value, a, "{\"thinking\":{\"type\":\"disabled\"}}", .{});
++    defer off.deinit();
++    var forced: generation_settings.Profile = .{};
++    forced.set(.enable_thinking, .{ .boolean = true }, true);
++    try std.testing.expect(resolveChatThinking(off.value.object, forced, false, -1, false).enable);
++}
++
++test "agent compatibility: idle and loading catalogs keep served capacity and no-vision" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"deepseek_v41\",\"max_position_embeddings\":1048576,\"vision_config\":{\"hidden_size\":1024}}" });
++    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
++    const path_len = try tmp.dir.realPath(io, &path_buf);
++    var cfg: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41_stream = true, .pack_dir = path_buf[0..path_len], .ctx_override = 262144 };
++    var e = agentCompatEntry(a, path_buf[0..path_len]);
++    e.config = &cfg;
++    const old_no_vision = scheduler_mod.no_vision_global;
++    scheduler_mod.no_vision_global = true;
++    defer scheduler_mod.no_vision_global = old_no_vision;
++    for ([_]model_registry_mod.LoadState{ .unloaded, .loading, .unloaded }) |state| {
++        e.state = state;
++        e.config = if (state == .loading) null else &cfg;
++        const row = try renderModelEntry(a, io, &e);
++        defer a.free(row);
++        const doc = try std.json.parseFromSlice(std.json.Value, a, row, .{});
++        defer doc.deinit();
++        const obj = doc.value.object;
++        try std.testing.expectEqual(@as(i64, 270336), obj.get("context_length").?.integer);
++        try std.testing.expectEqual(obj.get("context_length").?.integer, obj.get("max_model_len").?.integer);
++        const meta = obj.get("meta").?.object;
++        try std.testing.expectEqual(obj.get("context_length").?.integer, meta.get("context_length").?.integer);
++        try std.testing.expectEqual(@as(i64,1048576), meta.get("model_max_tokens").?.integer);
++        const modalities = obj.get("input_modalities").?.array.items;
++        try std.testing.expectEqual(@as(usize,1), modalities.len);
++        try std.testing.expectEqualStrings("text", modalities[0].string);
++        for (obj.get("capabilities").?.array.items) |cap| try std.testing.expect(!std.mem.eql(u8,cap.string,"vision"));
++    }
++}
+diff --git a/src/tests.zig b/src/tests.zig
+index b456633..10ae87d 100644
+--- a/src/tests.zig
++++ b/src/tests.zig
+@@ -6,6 +6,7 @@ pub const mlx = @import("mlx.zig");
+ pub const io_util = @import("io_util.zig");
+ pub const mtp_acceptance = @import("mtp_acceptance.zig");
+ pub const log = @import("log.zig");
++pub const plugin_profile: bool = @import("build_options").plugin_profile;
+ pub const dsa_nax = @import("dsa_nax.zig");
+ pub const sushi_exl3 = @import("sushi_exl3");
+ comptime {
+@@ -32,6 +33,9 @@ test {
+     _ = @import("generate.zig");
+     _ = @import("transformer.zig");
+     _ = @import("vision.zig");
++    _ = @import("vision_stream.zig");
++    _ = @import("vision_identity.zig");
++    _ = @import("experiment_stream_rows.zig");
+     _ = @import("qwen_vision.zig");
+     _ = @import("radio_vision.zig");
+     _ = @import("muse_vision.zig");
+diff --git a/src/vision_identity.zig b/src/vision_identity.zig
+new file mode 100644
+index 0000000..95e54c4
+--- /dev/null
++++ b/src/vision_identity.zig
+@@ -0,0 +1,24 @@
++const std = @import("std");
++
++/// The host hashes evaluated contiguous f32 image rows, their absolute token position and
++/// geometry. Token IDs alone cannot distinguish two images occupying the same prompt span.
++pub fn key(offset: u64, rows: u64, width: u64, payload: []const u8) [32]u8 {
++    var hash = std.crypto.hash.sha2.Sha256.init(.{});
++    hash.update("dsv41-vision-rows-v1\x00");
++    var metadata: [24]u8 = undefined;
++    std.mem.writeInt(u64, metadata[0..8], offset, .little);
++    std.mem.writeInt(u64, metadata[8..16], rows, .little);
++    std.mem.writeInt(u64, metadata[16..24], width, .little);
++    hash.update(&metadata);
++    hash.update(payload);
++    return hash.finalResult();
++}
++
++test "vision identity binds rows shape position and values before prefix matching" {
++    const t = std.testing;
++    const original = key(197, 184, 5120, "image rows");
++    try t.expectEqualSlices(u8, &original, &key(197, 184, 5120, "image rows"));
++    try t.expect(!std.mem.eql(u8, &original, &key(198, 184, 5120, "image rows")));
++    try t.expect(!std.mem.eql(u8, &original, &key(197, 5120, 184, "image rows")));
++    try t.expect(!std.mem.eql(u8, &original, &key(197, 184, 5120, "other rows")));
++}
+diff --git a/src/vision_stream.zig b/src/vision_stream.zig
+new file mode 100644
+index 0000000..0b45cde
+--- /dev/null
++++ b/src/vision_stream.zig
+@@ -0,0 +1,60 @@
++const std = @import("std");
++const chat = @import("chat.zig");
++
++/// The first candidate supports one contiguous image span. Reject mismatched marker/encoder
++/// counts instead of rendering text for image positions that never received embeddings.
++pub fn spanOffset(prompt: []const u32, image_id: u32, rows: usize) !u64 {
++    if (rows == 0 or image_id == 0) return error.InvalidVisionSpan;
++    var first: ?usize = null;
++    var count: usize = 0;
++    for (prompt, 0..) |id, i| {
++        if (id != image_id) continue;
++        if (first == null) first = i;
++        if (i != first.? + count) return error.MultipleVisionSpansUnsupported;
++        count += 1;
++    }
++    if (count != rows) return error.VisionPlaceholderCountMismatch;
++    return @intCast(first.?);
++}
++
++/// An old image turn cannot be reconstructed as text: refuse it explicitly in this candidate.
++pub fn rejectReason(messages: []const chat.Message) ?[]const u8 {
++    var latest_user: ?usize = null;
++    for (messages, 0..) |m, i| if (std.mem.eql(u8, m.role, "user")) {
++        latest_user = i;
++    };
++    var images: usize = 0;
++    for (messages, 0..) |m, i| {
++        if ((m.videos != null and m.videos.?.len > 0) or (m.audio != null and m.audio.?.len > 0))
++            return "This DeepSeek vision candidate supports one image only; video/audio is not supported";
++        if (m.images) |imgs| {
++            if (imgs.len == 0) continue;
++            if (latest_user == null or latest_user.? != i)
++                return "This DeepSeek vision candidate does not support images in chat history; start a new image turn";
++            for (imgs) |img| {
++                if (img.tile_rows != 0) return "Tiled image inputs are not supported by this DeepSeek vision candidate";
++                images += 1;
++            }
++        }
++    }
++    if (images > 1) return "This DeepSeek vision candidate supports exactly one image per request";
++    return null;
++}
++
++test "vision stream span validates offset and all image placeholders" {
++    const t = std.testing;
++    try t.expectEqual(@as(u64, 2), try spanOffset(&.{ 1, 2, 99, 99, 99, 3 }, 99, 3));
++    try t.expectError(error.VisionPlaceholderCountMismatch, spanOffset(&.{ 1, 99, 99, 3 }, 99, 3));
++    try t.expectError(error.MultipleVisionSpansUnsupported, spanOffset(&.{ 99, 1, 99 }, 99, 2));
++    try t.expectError(error.InvalidVisionSpan, spanOffset(&.{}, 99, 0));
++}
++
++test "vision stream accepts one latest image and refuses history multiple and audio" {
++    const t = std.testing;
++    const img: chat.ImageData = .{ .pixels = &.{}, .width = 1, .height = 1 };
++    try t.expect(rejectReason(&.{.{ .role = "user", .content = "Text" }}) == null);
++    try t.expect(rejectReason(&.{.{ .role = "user", .content = "Image?", .images = &.{img} }}) == null);
++    try t.expect(rejectReason(&.{.{ .role = "user", .content = "", .images = &.{ img, img } }}) != null);
++    try t.expect(rejectReason(&.{ .{ .role = "user", .content = "", .images = &.{img} }, .{ .role = "assistant", .content = "A" }, .{ .role = "user", .content = "Again" } }) != null);
++    try t.expect(rejectReason(&.{.{ .role = "user", .content = "", .audio = &.{.{ .samples = &.{} }} }}) != null);
++}

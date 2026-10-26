@@ -1,0 +1,63 @@
+--- a/app-web/src/lib/core/client.ts
++++ b/app-web/src/lib/core/client.ts
+@@ -48,7 +48,7 @@
+ 
+ export type ClientOptions = RequestOptions & { apiKey?: string; fetch?: typeof fetch; onRequestFinished?: (path: string, method: string) => void; };
+ 
+-export type OpenResponse = { response: Response; signal: AbortSignal; close(): void; };
++export type OpenResponse = { response: Response; signal: AbortSignal; close(): void; touch(): void; };
+ 
+ const record = (v: unknown): Record<string, unknown> =>
+   v !== null && typeof v === "object" && !Array.isArray(v)
+@@ -152,7 +152,7 @@
+       listeners.forEach((fn) => fn());
+       throw new StudioError("protocol", t("Timeout must be positive."));
+     }
+-    const timer = setTimeout(
++    let timer = setTimeout(
+       () =>
+         controller.abort(new StudioError("timeout", t("Request timed out."))),
+       timeout,
+@@ -165,6 +165,14 @@
+       listeners.forEach((fn) => fn());
+       controller.abort();
+       this.options.onRequestFinished?.(path, init.method ?? "GET");
++    };
++    const touch = () => {
++      if (closed || controller.signal.aborted) return;
++      clearTimeout(timer);
++      timer = setTimeout(
++        () => controller.abort(new StudioError("timeout", t("Request timed out."))),
++        timeout,
++      );
+     };
+     try {
+       throwIfAborted(controller.signal);
+@@ -208,7 +216,7 @@
+           response.status,
+         );
+       }
+-      return { response, signal: controller.signal, close };
++      return { response, signal: controller.signal, close, touch };
+     } catch (error) {
+       const result = this.error(error, controller.signal);
+       close();
+--- a/app-web/src/lib/core/chat.ts
++++ b/app-web/src/lib/core/chat.ts
+@@ -57,7 +57,7 @@
+   const opened = await client.open(
+     "/v1/chat/completions",
+     jsonPost(buildChatRequest(request)),
+-    options,
++    { timeoutMs: 30 * 60_000, ...options },
+   );
+   try {
+     if (!opened.response.body)
+@@ -65,6 +65,7 @@
+     for await (const event of readSSE(opened.response.body, {
+       signal: opened.signal,
+     })) {
++      opened.touch();
+       if (event.data === "[DONE]") {
+         finished = true;
+         break;

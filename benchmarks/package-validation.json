@@ -1,0 +1,32 @@
+{
+  "status": "passed",
+  "date": "2026-10-26",
+  "checks": [
+    {
+      "name": "runtime-version",
+      "exit_code": 0
+    },
+    {
+      "name": "python-units",
+      "exit_code": 0
+    },
+    {
+      "name": "python-compile",
+      "exit_code": 0
+    },
+    {
+      "name": "proxy-syntax",
+      "exit_code": 0
+    },
+    {
+      "name": "doctor",
+      "exit_code": 0
+    }
+  ],
+  "source_lock_sha256": "066cb6911a6d383feebe85fd452369c9d6990b4915bd498e0706ec11391e2407",
+  "native_source_reconstruction": "All changed files matched expected SHA256 after patch application.",
+  "native_compile": "Passed; cached compatible native dependencies reused.",
+  "runtime": "Packaged CLIversion loadedlibraries fromdist; nooriginalprojectlibrarydependency seen.",
+  "model_inference_requests": 0,
+  "scope": "Not a cleansecond-machine dependencybuild or a newfullmodel performance test."
+}

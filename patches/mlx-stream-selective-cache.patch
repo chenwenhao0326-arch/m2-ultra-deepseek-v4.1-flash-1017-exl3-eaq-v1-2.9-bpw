@@ -1,0 +1,841 @@
+diff --git a/src/arch/deepseek_v41/arm.zig b/src/arch/deepseek_v41/arm.zig
+index a7a052d..4fb1eb9 100644
+--- a/src/arch/deepseek_v41/arm.zig
++++ b/src/arch/deepseek_v41/arm.zig
+@@ -366,6 +366,12 @@ pub fn ArmWith(comptime G: type, comptime M: type, comptime routes: xp.Routes) t
+         pub fn discardParked(self: *Self) !u64 {
+             return self.hook.discardParked();
+         }
++        pub fn discardParkedLayer(self: *Self, layer: u32) !expert_stream.PoolBytes {
++            return self.hook.discardParkedLayer(layer);
++        }
++        pub fn extPoolBytesPerLayer(self: *const Self, expected_extra: u32, out: []expert_stream.PoolBytes) !void {
++            return self.hook.extPoolBytesPerLayer(expected_extra, out);
++        }
+         pub fn hasParked(self: *const Self) bool {
+             return self.hook.hasParked();
+         }
+diff --git a/src/arch/deepseek_v41/bill.zig b/src/arch/deepseek_v41/bill.zig
+index 1bc0571..406fba8 100644
+--- a/src/arch/deepseek_v41/bill.zig
++++ b/src/arch/deepseek_v41/bill.zig
+@@ -2665,6 +2665,90 @@ pub fn parkedQueryBill(full: Bill, pb: v41.PrefillBill, layer_major: bool, joinl
+     return parkedBillWithWave(full, ext_logical, ext_backing, wave);
+ }
+ 
++/// Same native full-context/workspace bill, retaining only a checked subset of
++/// per-layer extension owners. The caller must inventory each owner against its
++/// original geometry before supplying `retained`. All rounding remains charged
++/// for ALL layers; only absent persistent payload is removed from prompt slots.
++pub fn parkedSubsetBill(full: Bill, pb: v41.PrefillBill, layer_major: bool, joinless: bool, retained: expert_stream.PoolBytes, query: ?@import("parked_ext.zig").Query) !Bill {
++    if(full.decode_rows<full.prefill_rows)return error.ParkedBackingGeometry;
++    const maximum=@as(u64,full.decode_rows-full.prefill_rows)*full.persistentRowBytes();
++    const rounding=@as(u64,full.layers)*expert_bank.n_components*module.grow_alloc_round_bytes;
++    if(retained.logical>maximum or retained.backing<retained.logical or retained.backing>retained.logical+rounding or (retained.logical==0 and retained.backing!=0))return error.ParkedBackingGeometry;
++    var bill=if(query) |q| try parkedQueryBill(full,pb,layer_major,joinless,maximum,maximum+rounding,q)
++        else try parkedPromptBill(full,pb,layer_major,joinless,maximum,maximum+rounding);
++    bill.slot_prefill-=maximum-retained.logical;
++    return bill;
++}
++
++test "partial park: every full-context and decode term survives subset admission" {
++    const c=try realConfig();const config:settings.Config=.{};
++    const pb=try prefillBillAt(&config,.{},&c,4);
++    var full=cell4Bill();
++    full.persistent_row_bytes=510504960;
++    full.max_record_bytes=13315584;
++    const extra=@as(u64,full.decode_rows-full.prefill_rows);
++    const maximum=extra*full.persistentRowBytes();
++    const rounding=@as(u64,full.layers)*expert_bank.n_components*module.grow_alloc_round_bytes;
++    const whole=try parkedPromptBill(full,pb,true,true,maximum,maximum+rounding);
++    var retained:u64=0;
++    for(0..41) |count| {
++        const partial=try parkedSubsetBill(full,pb,true,true,.{.logical=retained,.backing=retained},null);
++        inline for(@typeInfo(Bill).@"struct".field_names) |field| {
++            if(comptime !std.mem.eql(u8,field,"slot_prefill"))try testing.expectEqualDeep(@field(whole,field),@field(partial,field));
++        }
++        try testing.expectEqual(full.slot_prefill+retained+rounding,partial.slot_prefill);
++        try testing.expectEqualDeep(whole.decodeTerms(),partial.decodeTerms());
++        try testing.expect(partial.prefillTotal()<=whole.prefillTotal());
++        try testing.expect(parkedPossibleAdded(partial,123)>=123+partial.decodeTerms().kv+partial.decodeTerms().waves);
++        if(count==0 or count==8 or count==20 or count==40) {
++            const mb=try memoryBill(testing.allocator,partial);defer mb.free(testing.allocator);
++            try testing.expectEqual(partial.prefillTotal()-partial.baseline,mb.total(.prompt,0,partial.prefill_rows));
++            try testing.expectEqual(partial.decodeTotal()-partial.baseline,mb.total(.decode,0,partial.decode_rows));
++            try sdk.admit(mb,0,.{.prompt=partial.prefill_rows,.decode=partial.decode_rows},partial.processBound());
++        }
++        if(count<40)retained+=extra*@as(u64,if(count>=18 and count<=22) 8891904 else 13315584);
++    }
++    try testing.expectEqual(maximum,retained);
++    try testing.expectError(error.ParkedBackingGeometry,parkedSubsetBill(full,pb,true,true,.{.logical=maximum+1,.backing=maximum+1},null));
++    try testing.expectError(error.ParkedBackingGeometry,parkedSubsetBill(full,pb,true,true,.{.logical=1,.backing=0},null));
++    try testing.expectError(error.ParkedBackingGeometry,parkedSubsetBill(full,pb,true,true,.{.logical=0,.backing=1},null));
++    const q:@import("parked_ext.zig").Query=.{.rows=16,.positions=262144};
++    const original=try parkedQueryBill(full,pb,true,true,maximum,maximum+rounding,q);
++    const small=try parkedSubsetBill(full,pb,true,true,.{.logical=maximum/2,.backing=maximum/2},q);
++    try testing.expectEqual(original.prefill_wave,small.prefill_wave);
++    try testing.expectEqualDeep(original.decodeTerms(),small.decodeTerms());
++}
++
++test "partial park actual245310 native budget from metadata only" {
++    const dir=std.mem.span(std.c.getenv("DSV41_PARTIAL_BILL_AUDIT") orelse return error.SkipZigTest);
++    const setting_path=std.mem.span(std.c.getenv("CAUSAL_MODEL_SETTINGS") orelse return error.SettingsPathMissing);
++    var arena=std.heap.ArenaAllocator.init(testing.allocator);defer arena.deinit();const a=arena.allocator();
++    var config=try @import("host.zig").loadConfig(testing.io,a,dir);
++    const raw=try std.Io.Dir.cwd().readFileAlloc(testing.io,setting_path,a,.limited(1<<20));
++    const document=try std.json.parseFromSliceLeaky(std.json.Value,a,raw,.{});
++    config.applySettings(document.object.get(dir) orelse return error.ModelSettingsMissing);
++    config.expert_prefill_rows=245;config.expert_rows=310;config.max_context_tokens=262144;config.memory_baseline_bytes=0;config.vision_enabled=false;
++    const full=try servedBill(a,testing.io,&config,0,190<<30,.{});
++    var diag:v41.Diag=.{};const mc=try v41.Config.load(a,testing.io,dir,&diag);
++    const pb=try servedPrefillBill(&config,.{},&mc,full.variant);
++    try testing.expectEqual(@as(u64,510504960),full.persistentRowBytes());
++    const whole=65*full.persistentRowBytes();
++    const scratch=full.slot_prefill-245*full.persistentRowBytes();
++    for([_]u32{0,8,10,20,40}) |released| {
++        var retained:u64=whole;
++        for(0..released) |i| {
++            const layer=39-i;
++            retained-=65*@as(u64,if(layer>=18 and layer<=22) 8891904 else 13315584);
++        }
++        const b=try parkedSubsetBill(full,pb,config.dsv41LayerMajor(),joinlessRoute(.{}),.{.logical=retained,.backing=retained},null);
++        const mb=try memoryBill(a,b);
++        try sdk.admit(mb,0,.{.prompt=245,.decode=310},180<<30);
++        try testing.expectEqual(full.decodeTerms(),b.decodeTerms());
++        const record=try std.json.Stringify.valueAlloc(a,.{.rows=.{@as(u32,245),@as(u32,310)},.context=@as(u32,262144),.released_layers=released,.retained_bytes=retained,.process_bound=b.processBound(),.prompt_terms=b.prefillTerms(),.decode_terms=b.decodeTerms(),.positive_added=parkedPossibleAdded(b,scratch),.scratch=scratch},.{});
++        std.debug.print("PARTIAL_BILL {s}\n",.{record});
++    }
++}
++
+ fn parkedBillWithWave(full: Bill, ext_logical: u64, ext_backing: u64, wave: u64) !Bill {
+     const rounding = @as(u64, full.layers) * expert_bank.n_components * module.grow_alloc_round_bytes;
+     if (full.decode_rows < full.prefill_rows) return error.ParkedBackingGeometry;
+@@ -2954,3 +3038,33 @@ test "optimized release native text profiles" {
+ 
+     }
+ }
++
++test "partial park actual224288 native budget from metadata only" {
++    const dir=std.mem.span(std.c.getenv("DSV41_PARTIAL_BILL_AUDIT") orelse return error.SkipZigTest);
++    const setting_path=std.mem.span(std.c.getenv("CAUSAL_MODEL_SETTINGS") orelse return error.SettingsPathMissing);
++    var arena=std.heap.ArenaAllocator.init(testing.allocator);defer arena.deinit();const a=arena.allocator();
++    var config=try @import("host.zig").loadConfig(testing.io,a,dir);
++    const raw=try std.Io.Dir.cwd().readFileAlloc(testing.io,setting_path,a,.limited(1<<20));
++    const document=try std.json.parseFromSliceLeaky(std.json.Value,a,raw,.{});
++    config.applySettings(document.object.get(dir) orelse return error.ModelSettingsMissing);
++    config.expert_prefill_rows=224;config.expert_rows=288;config.max_context_tokens=262144;config.memory_baseline_bytes=0;config.vision_enabled=false;
++    const full=try servedBill(a,testing.io,&config,0,190<<30,.{});
++    var diag:v41.Diag=.{};const mc=try v41.Config.load(a,testing.io,dir,&diag);
++    const pb=try servedPrefillBill(&config,.{},&mc,full.variant);
++    try testing.expectEqual(@as(u64,510504960),full.persistentRowBytes());
++    const whole=64*full.persistentRowBytes();
++    const scratch=full.slot_prefill-224*full.persistentRowBytes();
++    for([_]u32{0,8,10,20,40}) |released| {
++        var retained:u64=whole;
++        for(0..released) |i| {
++            const layer=39-i;
++            retained-=64*@as(u64,if(layer>=18 and layer<=22) 8891904 else 13315584);
++        }
++        const b=try parkedSubsetBill(full,pb,config.dsv41LayerMajor(),joinlessRoute(.{}),.{.logical=retained,.backing=retained},null);
++        const mb=try memoryBill(a,b);
++        try sdk.admit(mb,0,.{.prompt=224,.decode=288},180<<30);
++        try testing.expectEqual(full.decodeTerms(),b.decodeTerms());
++        const record=try std.json.Stringify.valueAlloc(a,.{.rows=.{@as(u32,224),@as(u32,288)},.context=@as(u32,262144),.released_layers=released,.retained_bytes=retained,.process_bound=b.processBound(),.prompt_terms=b.prefillTerms(),.decode_terms=b.decodeTerms(),.positive_added=parkedPossibleAdded(b,scratch),.scratch=scratch},.{});
++        std.debug.print("PROFILE224288_BILL {s}\n",.{record});
++    }
++}
+diff --git a/src/arch/deepseek_v41/experts.zig b/src/arch/deepseek_v41/experts.zig
+index 1ba2b0d..e0c9638 100644
+--- a/src/arch/deepseek_v41/experts.zig
++++ b/src/arch/deepseek_v41/experts.zig
+@@ -1345,6 +1345,14 @@ pub fn ExpertsWith(comptime G: type, comptime S: type, comptime M: type, comptim
+         pub fn discardParked(self: *Self) !u64 {
+             return self.source.discardParked();
+         }
++        pub fn discardParkedLayer(self: *Self, layer: u32) !expert_stream.PoolBytes {
++            if (layer >= self.banks.len) return error.InvalidRows;
++            if (self.banks[layer][@backingInt(BankKind.ext)] != null) return error.ParkedRowsStillBound;
++            return self.source.discardParkedLayer(layer);
++        }
++        pub fn extPoolBytesPerLayer(self: *const Self, expected_extra: u32, out: []expert_stream.PoolBytes) !void {
++            return self.source.extPoolBytesPerLayer(expected_extra, out);
++        }
+         pub fn hasParked(self: *const Self) bool {
+             return self.source.hasParked();
+         }
+diff --git a/src/arch/deepseek_v41/module.zig b/src/arch/deepseek_v41/module.zig
+index 8d4e88e..85e8d49 100644
+--- a/src/arch/deepseek_v41/module.zig
++++ b/src/arch/deepseek_v41/module.zig
+@@ -824,6 +824,11 @@ pub const Module = struct {
+     park_possible_added: u64 = 0,
+     park_logical: u64 = 0,
+     park_backing: u64 = 0,
++    park_partial_pending: bool = false,
++    park_released_layers: [40]u32 = undefined,
++    park_n_released: usize = 0,
++    park_released_bytes: expert_stream.PoolBytes = .{},
++    park_refresh_wait_ms: u64 = 0,
+ 
+     /// The Module holds its prompt configuration (the scratch, the prompt rows, the prompt cache limit): false from a
+     /// prompt's tail release or phase change until the reverse phase change (`requestEnd`).
+@@ -1059,6 +1064,7 @@ pub const Module = struct {
+         log.info("numeric tier: {t}\n", .{config.numeric_tier orelse .served});
+         self.model = try M.initWith(gpa, &self.g, c, tier, weights, &self.engram, .{ .registry = &self.set.reg });
+         self.model.prefill_suffix_enabled = experimentFlag("DSV41_EXPERIMENT_PREFILL_SUFFIX");
++        if(park_ext.partialEnabled())log.info("NATIVE partial park: tail layers released only as needed; fresh actual usage and native admission required; original180/190 limits\n",.{});
+         errdefer self.model.deinit(&self.g);
+         // HEAD_MODE mxfp8: the model evaluated its quantized head at construction and reads nothing else of the
+         // dense one (the draft head takes the model's), so the checkpoint's bf16 head leaves the device here.
+@@ -1867,6 +1873,35 @@ pub const Module = struct {
+         };
+     }
+ 
++    fn partialParkActive(self: *const Module) bool {
++        return park_ext.partialEnabled() and park_ext.partialGeometry(self.bill.prefill_rows,self.bill.decode_rows,self.bill.layers,self.bill.n_experts);
++    }
++
++    /// Actual owners only; validate every layer before the native bill sees a sum.
++    fn parkInventory(self: *Module, costs: *[40]expert_stream.PoolBytes) !expert_stream.PoolBytes {
++        if(!self.partialParkActive())return error.PartialParkGeometry;
++        switch(self.arm){inline else=>|t| try t.arm.extPoolBytesPerLayer(self.bill.decode_rows-self.bill.prefill_rows,costs)}
++        var total:expert_stream.PoolBytes=.{};
++        for(costs) |cost| {
++            total.logical=try std.math.add(u64,total.logical,cost.logical);
++            total.backing=try std.math.add(u64,total.backing,cost.backing);
++        }
++        return total;
++    }
++
++    fn parkBillFor(self: *Module, bytes: expert_stream.PoolBytes) !bill_mod.Bill {
++        const tc=self.turn_call orelse return error.ParkCallMissing;
++        if(self.partialParkActive())return bill_mod.parkedSubsetBill(self.bill,tc.pb,tc.layer_major,tc.joinless,bytes,self.park_query);
++        return if(self.park_query) |q| bill_mod.parkedQueryBill(self.bill,tc.pb,tc.layer_major,tc.joinless,bytes.logical,bytes.backing,q)
++            else bill_mod.parkedPromptBill(self.bill,tc.pb,tc.layer_major,tc.joinless,bytes.logical,bytes.backing);
++    }
++
++    fn admitPark(self:*Module,b:bill_mod.Bill,limits:park_ext.Limits) !bool {
++        const mb=try bill_mod.memoryBill(self.gpa,b);defer mb.free(self.gpa);
++        sdk.admit(mb,0,.{.prompt=b.prefill_rows,.decode=b.decode_rows},limits.process) catch return false;
++        return true;
++    }
++
+     fn choosePark(self: *Module, coming: Coming) !void {
+         if (!park_ext.enabled()) return;
+         if (coming == .unknown or self.park_incoming == null) {
+@@ -1876,55 +1911,120 @@ pub const Module = struct {
+         if (!self.park_choice_pending) return;
+         self.park_choice_pending = false;
+         self.park_request_bill = null;
++        self.park_partial_pending = false;
++        self.park_n_released = 0;
++        self.park_released_bytes = .{};
++        self.park_refresh_wait_ms = 0;
+         self.park_box_used = null;
+         self.park_possible_added = 0;
+         self.park_logical = 0;
+         self.park_backing = 0;
+         self.park_query = if (park_ext.longPrefixEnabled()) parkQuery(coming) else null;
+-        defer self.logParkDecision();
++        // A trial has not admitted any allocation. Its final live check logs later.
++        defer if(!self.park_partial_pending) self.logParkDecision();
+         self.park_reason = park_ext.queryShapeRefusal(true, self.park_incoming, self.state_has_vision, self.bill.prefill_rows, self.bill.decode_rows, self.bill.layers, self.bill.n_experts, self.park_query);
+-        if (self.park_query) |q| if (q.positions > self.max_context) {
+-            self.park_reason = .query_mismatch;
+-        };
++        if (self.park_query) |q| {
++            if (q.positions > self.max_context) self.park_reason = .query_mismatch;
++        }
+         if (self.park_reason != null) return;
+-        if (self.decode_extra != 0 or self.grown_rows != null) {
++        if (self.decode_extra != 0 or self.grown_rows != null or self.turn_call==null) {
+             self.park_reason = .geometry;
+             return;
+         }
+-        const tc = self.turn_call orelse {
+-            self.park_reason = .geometry;
+-            return;
+-        };
+-        const bytes = switch (self.arm) {
+-            inline else => |t| try t.arm.extPoolBytes(),
+-        };
+-        self.park_logical = bytes.logical;
+-        self.park_backing = bytes.backing;
+-        if (bytes.logical == 0) {
+-            self.park_reason = .no_pool;
+-            return;
++        var costs:[40]expert_stream.PoolBytes=undefined;
++        const bytes=if(self.partialParkActive()) try self.parkInventory(&costs) else switch(self.arm){inline else=>|t| try t.arm.extPoolBytes()};
++        self.park_logical=bytes.logical;self.park_backing=bytes.backing;
++        if(bytes.logical==0){self.park_reason=.no_pool;return;}
++        const b=self.parkBillFor(bytes) catch {self.park_reason=.geometry;return;};
++        const limits=park_ext.limitsForRows(b.prefill_rows,b.decode_rows);
++        const admitted=try self.admitPark(b,limits);
++        const scratch=switch(self.arm){inline else=>|t| t.arm.stream.promptTransientBytes()};
++        self.park_possible_added=bill_mod.parkedPossibleAdded(b,scratch);
++        self.park_box_used=sdk.memory.boxUsedBytes();
++        self.park_reason=if(!admitted) .process_budget else park_ext.budgetRefusalWithLimits(b.processBound(),self.park_box_used,self.park_possible_added,limits);
++        if(self.park_reason==null){self.park_request_bill=b;return;}
++        if(self.partialParkActive() and self.park_box_used!=null and (self.park_reason==.box_pressure or self.park_reason==.process_budget)) {
++            // Provisional owner moves allocate nothing. If even zero retained
++            // payload cannot fit the native process bill, keep the old fallback.
++            const cold=try self.parkBillFor(.{});
++            if(try self.admitPark(cold,limits))self.park_partial_pending=true;
+         }
+-        const b = (if (self.park_query) |q|
+-            bill_mod.parkedQueryBill(self.bill, tc.pb, tc.layer_major, tc.joinless, bytes.logical, bytes.backing, q)
+-        else
+-            bill_mod.parkedPromptBill(self.bill, tc.pb, tc.layer_major, tc.joinless, bytes.logical, bytes.backing)) catch {
+-            self.park_reason = .geometry;
+-            return;
+-        };
+-        const mb = try bill_mod.memoryBill(self.gpa, b);
+-        defer mb.free(self.gpa);
+-        const limits = park_ext.limitsForRows(b.prefill_rows, b.decode_rows);
+-        sdk.admit(mb, 0, .{ .prompt = b.prefill_rows, .decode = b.decode_rows }, limits.process) catch {
+-            self.park_reason = .process_budget;
+-            return;
+-        };
+-        const scratch = switch (self.arm) {
+-            inline else => |t| t.arm.stream.promptTransientBytes(),
+-        };
+-        self.park_possible_added = bill_mod.parkedPossibleAdded(b, scratch);
+-        self.park_box_used = sdk.memory.boxUsedBytes();
+-        self.park_reason = park_ext.budgetRefusalWithLimits(b.processBound(), self.park_box_used, self.park_possible_added, limits);
+-        if (self.park_reason == null) self.park_request_bill = b;
++    }
++
++    /// Called only after synchronization/unbinding and the reverse phase's frees.
++    /// Plans use byte counts; allocations require a NEW global reading and native
++    /// admission after the actual frees have been verified by the existing fence.
++    fn finishPartialPark(self:*Module) !u64 {
++        if(!self.park_partial_pending)return 0;
++        self.park_partial_pending=false;
++        defer self.logParkDecision();
++        const pp=@import("partial_park.zig");
++        const limits=park_ext.limitsForRows(self.bill.prefill_rows,self.bill.decode_rows);
++        const scratch=switch(self.arm){inline else=>|t| t.arm.stream.promptTransientBytes()};
++        var refreshed_used:?u64=null;
++        var have_refreshed=false;
++        for(0..41) |_| {
++            var costs:[40]expert_stream.PoolBytes=undefined;
++            const remaining=try self.parkInventory(&costs);
++            self.park_logical=remaining.logical;self.park_backing=remaining.backing;
++            if(remaining.logical==0){self.park_request_bill=null;self.park_reason=.no_pool;return self.park_released_bytes.backing;}
++            const b=try self.parkBillFor(remaining);
++            self.park_possible_added=bill_mod.parkedPossibleAdded(b,scratch);
++            self.park_box_used=if(have_refreshed) refreshed_used else sdk.memory.boxUsedBytes();
++            have_refreshed=false;
++            const sampled_at=std.Io.Timestamp.now(self.io,.boot);
++            self.park_reason=park_ext.budgetRefusalWithLimits(b.processBound(),self.park_box_used,self.park_possible_added,limits);
++            if(self.park_reason==null) {
++                if(!(try self.admitPark(b,limits)))return error.PartialParkAdmissionMismatch;
++                self.park_request_bill=b;
++                return self.park_released_bytes.backing;
++            }
++            var order:[40]pp.PoolCost=undefined;
++            for(&order,0..) |*cost,i| cost.*=.{.logical=costs[39-i].logical,.backing=costs[39-i].backing};
++            const Projector=struct {
++                bill:bill_mod.Bill,
++                pub fn processAfterRemoving(p:@This(),logical:u64) u64 {
++                    var projected=p.bill;
++                    if(logical>projected.slot_prefill)return std.math.maxInt(u64);
++                    projected.slot_prefill-=logical;
++                    return projected.processBound();
++                }
++            };
++            const count=pp.releaseCountFor(&order,self.park_box_used,self.park_possible_added,limits.box,limits.process,Projector{.bill=b}) orelse 40;
++            if(count==0)return error.PartialParkAdmissionMismatch;
++            const before=BoundaryMemory.now();
++            var batch:u64=0;
++            for(0..count) |i| {
++                const layer:u32=@intCast(39-i);const cost=costs[layer];
++                if(cost.backing==0)continue;
++                const actual=switch(self.arm){inline else=>|t| try t.arm.discardParkedLayer(layer)};
++                if(actual.logical!=cost.logical or actual.backing!=cost.backing)return error.PartialParkOwnerChanged;
++                if(self.park_n_released>=40)return error.PartialParkReleaseLoop;
++                self.park_released_layers[self.park_n_released]=layer;self.park_n_released+=1;
++                self.park_released_bytes.logical+=actual.logical;self.park_released_bytes.backing+=actual.backing;
++                batch+=actual.backing;
++            }
++            if(batch==0)return error.PartialParkNoProgress;
++            self.g.clearCache();
++            _=mlx.mlx_synchronize(self.g.s);
++            const st=settleReadings(LiveReader{.io=self.io},before,batch,self.installed.phase_change_poll_ms,null);
++            try checkSettled(before,st.after,batch,null);
++            const RefreshContext=struct{
++                module:*Module,at:std.Io.Timestamp,
++                pub fn elapsedMs(c:*@This())u64{return @intCast(@divTrunc(@max(c.at.untilNow(c.module.io,.boot).nanoseconds,0),std.time.ns_per_ms));}
++                pub fn wait(c:*@This(),ms:u64)void{std.Io.sleep(c.module.io,.fromMilliseconds(@intCast(ms)),.real) catch {};}
++                pub fn read(_: *@This())?u64{return sdk.memory.boxUsedBytes();}
++            };
++            var refresh_context:RefreshContext=.{.module=self,.at=sampled_at};
++            const refresh=pp.refreshAfterRelease(&refresh_context,self.park_box_used,batch,self.park_possible_added,limits.box);
++            self.park_refresh_wait_ms+=refresh.waited_ms;
++            const event=try std.json.Stringify.valueAlloc(self.gpa,.{.released_layers=self.park_released_layers[0..self.park_n_released],.batch_bytes=batch,.box_before=self.park_box_used,.box_after=refresh.used,.refresh_wait_ms=refresh.waited_ms,.samples=refresh.samples},.{});
++            defer self.gpa.free(event);
++            log.info("NATIVE PARTIAL_PARK_REFRESH {s}\n",.{event});
++            refreshed_used=refresh.used;have_refreshed=true;
++            // Use that reported sample, never a subtraction of planned frees.
++        }
++        return error.PartialParkReleaseLoop;
+     }
+ 
+     fn logParkDecision(self: *Module) void {
+@@ -1940,6 +2040,11 @@ pub const Module = struct {
+             .possible_added = self.park_possible_added,
+             .box_target = park_ext.limitsForRows(self.bill.prefill_rows, self.bill.decode_rows).box,
+             .process_bound = if (self.park_request_bill) |b| b.processBound() else null,
++            .partial_retention = self.partialParkActive(),
++            .released_layers = self.park_released_layers[0..self.park_n_released],
++            .released_logical_bytes = self.park_released_bytes.logical,
++            .released_backing_bytes = self.park_released_bytes.backing,
++            .box_refresh_wait_ms = self.park_refresh_wait_ms,
+         }, .{}) catch return;
+         defer self.gpa.free(json);
+         log.info("NATIVE PARKED_EXT {s}\n", .{json});
+@@ -2494,6 +2599,7 @@ pub const Module = struct {
+         // Eligibility is known before S05's cache switch. Re-evaluate even on a prompt-only cancellation.
+         self.choosePark(coming) catch |e| return self.refuseBoundary(e);
+         if (self.prompt_ready) {
++            if(self.park_partial_pending) _=try self.finishPartialPark();
+             if (park_ext.enabled() and self.hasParked() and self.park_request_bill == null)
+                 self.discardParkedSettled() catch |e| return self.refuseBoundary(e);
+             return;
+@@ -2554,11 +2660,11 @@ pub const Module = struct {
+             x.residents = if (x.shrunk) reverseResidents(x.coming, m.prompt_residents) else .keep;
+             const pool_t0 = std.Io.Timestamp.now(m.io, .boot);
+             const freed = if (x.shrunk) switch (m.arm) {
+-                inline else => |t| if (m.park_request_bill != null) try t.arm.parkForPrompt(x.residents) else try t.arm.shrink(x.residents),
+-            } else if (park_ext.enabled() and m.hasParked() and m.park_request_bill == null) switch (m.arm) {
++                inline else => |t| if (m.park_request_bill != null or m.park_partial_pending) try t.arm.parkForPrompt(x.residents) else try t.arm.shrink(x.residents),
++            } else if (park_ext.enabled() and m.hasParked() and m.park_request_bill == null and !m.park_partial_pending) switch (m.arm) {
+                 inline else => |t| try t.arm.discardParked(),
+             } else 0;
+-            m.logPoolTransition(if (m.park_request_bill != null) "park" else "release", pool_t0);
++            m.logPoolTransition(if (m.park_request_bill != null or m.park_partial_pending) "park" else "release", pool_t0);
+             x.scratch_absent = switch (m.arm) {
+                 inline else => |t| t.arm.stream.transient_released,
+             };
+@@ -2575,8 +2681,9 @@ pub const Module = struct {
+         }
+ 
+         /// Until the footprint shows the frees and sits at most `reverseBound`, then the one check (by name).
+-        pub fn settle(x: *ReverseLive, freed: u64) !void {
++        pub fn settle(x: *ReverseLive, initially_freed: u64) !void {
+             const m = x.m;
++            const freed=initially_freed+try m.finishPartialPark();
+             const scratch = if (x.scratch_absent) switch (m.arm) {
+                 inline else => |t| t.arm.stream.promptTransientBytes(),
+             } else 0;
+@@ -4718,7 +4825,8 @@ test "causality observer: real HTTP entrypoints and export compile without execu
+     std.mem.doNotOptimizeAway(&causality.finish);
+ }
+ 
+-test "parked ext module: real request and cancellation lifecycle typechecks without execution" {
++test "partial park module: real request and cancellation lifecycle typechecks without execution" {
++    std.mem.doNotOptimizeAway(&Module.finishPartialPark);
+     std.mem.doNotOptimizeAway(&Module.prepareIncomingRequest);
+     std.mem.doNotOptimizeAway(&Module.restorePrefix);
+     std.mem.doNotOptimizeAway(&Module.prefillVisionAt);
+diff --git a/src/arch/deepseek_v41/parked_ext.zig b/src/arch/deepseek_v41/parked_ext.zig
+index 3b7f491..2d59ed9 100644
+--- a/src/arch/deepseek_v41/parked_ext.zig
++++ b/src/arch/deepseek_v41/parked_ext.zig
+@@ -12,7 +12,56 @@ fn wide272Enabled() bool {
+     const raw = std.c.getenv("DSV41_EXPERIMENT_WIDE_PARK") orelse return false;
+     return std.mem.eql(u8, std.mem.span(raw), "1");
+ }
++fn current245310Enabled() bool {
++    if (comptime !sdk.plugin_profile) return false;
++    const raw = std.c.getenv("DSV41_EXPERIMENT_PARK245310") orelse return false;
++    return std.mem.eql(u8, std.mem.span(raw), "1");
++}
++fn current224288Enabled() bool {
++    if (comptime !sdk.plugin_profile) return false;
++    const raw = std.c.getenv("DSV41_EXPERIMENT_PARK224288") orelse return false;
++    return std.mem.eql(u8, std.mem.span(raw), "1");
++}
++pub fn partialGeometry(prefill: u32, decode: u32, layers: u32, experts: u32) bool {
++    return layers == 40 and experts == 384 and
++        ((prefill == 245 and decode == 310 and current245310Enabled()) or
++        (prefill == 224 and decode == 288 and current224288Enabled()));
++}
++test "partial park224288: explicit profile opt-in preserves exact geometry and original budgets" {
++    if (comptime !sdk.plugin_profile) return error.SkipZigTest;
++    const Env = struct {
++        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
++        extern "c" fn unsetenv([*:0]const u8) c_int;
++    };
++    const T = std.testing;
++    _ = Env.unsetenv("DSV41_EXPERIMENT_PARK224288");
++    try T.expect(!partialGeometry(224, 288, 40, 384));
++    _ = Env.setenv("DSV41_EXPERIMENT_PARK224288", "1", 1);
++    defer _ = Env.unsetenv("DSV41_EXPERIMENT_PARK224288");
++    try T.expect(partialGeometry(224, 288, 40, 384));
++    try T.expect(!partialGeometry(224, 287, 40, 384));
++    try T.expect(!partialGeometry(225, 288, 40, 384));
++    try T.expect(!partialGeometry(224, 288, 39, 384));
++    const req: Incoming = .{ .total = 256, .max_tokens = 4096, .host_context = 262144, .image = false };
++    try T.expect(shapeRefusal(true, req, false, 224, 288, 40, 384) == null);
++    try T.expectEqual(Refusal.image, shapeRefusal(true, req, true, 224, 288, 40, 384).?);
++    const limits = limitsForRows(224, 288);
++    try T.expectEqual(Limits{ .process = 180 << 30, .box = 190 << 30 }, limits);
++    try T.expectEqual(Refusal.box_pressure, budgetRefusalWithLimits(160 << 30, 180 << 30, 11 << 30, limits).?);
++    try T.expectEqual(Refusal.process_budget, budgetRefusalWithLimits((180 << 30) + 1, 0, 0, limits).?);
++    var long = req;
++    long.total = 8192;
++    try T.expectEqual(Refusal.long_prompt, queryShapeRefusal(true, long, false, 224, 288, 40, 384, null).?);
++    try T.expect(queryShapeRefusal(true, long, false, 224, 288, 40, 384, .{ .rows = 64, .positions = 8192 }) == null);
++}
++pub fn partialEnabled() bool {
++    if (comptime !sdk.plugin_profile) return false;
++    const raw=std.c.getenv("DSV41_EXPERIMENT_PARTIAL_PARK") orelse return false;
++    return enabled() and std.mem.eql(u8,std.mem.span(raw),"1") and (current245310Enabled() or current224288Enabled());
++}
+ pub fn limitsForRows(prefill: u32, decode: u32) Limits {
++    if (prefill == 224 and decode == 288 and current224288Enabled()) return .{ .process = 180 << 30, .box = 190 << 30 };
++    if (prefill == 245 and decode == 310 and current245310Enabled()) return .{ .process = 180 << 30, .box = 190 << 30 };
+     if (prefill == 128 and decode == 272 and wide272Enabled()) return .{ .process = 176 << 30, .box = 192 << 30 };
+     if (prefill == 128 and decode == 184) return .{ .process = 128 << 30, .box = 188 << 30 };
+     return .{ .process = process_cap, .box = box_target };
+@@ -41,7 +90,7 @@ pub fn shapeRefusal(on: bool, incoming: ?Incoming, previous_image: bool, prefill
+     const req = incoming orelse return .unknown_shape;
+     if (req.image or previous_image) return .image;
+     if (req.total == 0 or req.total > max_prompt_tokens) return .long_prompt;
+-    const geometry = ((prefill == 182 or prefill == 200 or prefill == 208) and decode == 245) or (prefill == 128 and decode == 184) or (prefill == 128 and decode == 272 and wide272Enabled());
++    const geometry = ((prefill == 182 or prefill == 200 or prefill == 208) and decode == 245) or (prefill == 128 and decode == 184) or (prefill == 128 and decode == 272 and wide272Enabled()) or partialGeometry(prefill, decode, layers, experts);
+     if (!geometry or layers != 40 or experts != 384) return .geometry;
+     return null;
+ }
+@@ -161,3 +210,30 @@ test "parked ext wide272 opt-in still requires native process and live host budg
+     try std.testing.expectEqual(Refusal.process_budget, budgetRefusalWithLimits((176 << 30) + 1, 0, 0, lim).?);
+     try std.testing.expectEqual(Refusal.box_unknown, budgetRefusalWithLimits(170 << 30, null, 0, lim).?);
+ }
++
++test "current245310 park policy is opt-in and keeps all shape and budget guards" {
++    if (comptime !sdk.plugin_profile) return error.SkipZigTest;
++    const Env = struct {
++        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
++        extern "c" fn unsetenv([*:0]const u8) c_int;
++    };
++    const req: Incoming = .{ .total=128, .max_tokens=8192, .host_context=262144, .image=false };
++    _ = Env.unsetenv("DSV41_EXPERIMENT_PARK245310");
++    try std.testing.expectEqual(Refusal.geometry, shapeRefusal(true, req, false, 245, 310, 40, 384).?);
++    _ = Env.setenv("DSV41_EXPERIMENT_PARK245310", "1", 1);
++    defer _ = Env.unsetenv("DSV41_EXPERIMENT_PARK245310");
++    try std.testing.expect(shapeRefusal(true, req, false, 245, 310, 40, 384) == null);
++    try std.testing.expectEqual(Refusal.geometry, shapeRefusal(true, req, false, 246, 310, 40, 384).?);
++    try std.testing.expectEqual(Refusal.geometry, shapeRefusal(true, req, false, 245, 311, 40, 384).?);
++    try std.testing.expectEqual(Refusal.image, shapeRefusal(true, req, true, 245, 310, 40, 384).?);
++    const lim=limitsForRows(245,310);
++    try std.testing.expectEqual(@as(u64,180<<30),lim.process);
++    try std.testing.expectEqual(@as(u64,190<<30),lim.box);
++    try std.testing.expect(budgetRefusalWithLimits(179<<30,180<<30,9<<30,lim)==null);
++    try std.testing.expectEqual(Refusal.process_budget,budgetRefusalWithLimits((180<<30)+1,0,0,lim).?);
++    try std.testing.expectEqual(Refusal.box_pressure,budgetRefusalWithLimits(179<<30,185<<30,6<<30,lim).?);
++    const long: Incoming=.{ .total=14575,.max_tokens=8192,.host_context=262144,.image=false };
++    try std.testing.expectEqual(Refusal.long_prompt,queryShapeRefusal(true,long,false,245,310,40,384,null).?);
++    try std.testing.expect(queryShapeRefusal(true,long,false,245,310,40,384,.{.rows=16,.positions=14575})==null);
++    try std.testing.expectEqual(Refusal.long_query,queryShapeRefusal(true,long,false,245,310,40,384,.{.rows=257,.positions=14575}).?);
++}
+diff --git a/src/arch/deepseek_v41/partial_park.zig b/src/arch/deepseek_v41/partial_park.zig
+new file mode 100644
+index 0000000..87fd74d
+--- /dev/null
++++ b/src/arch/deepseek_v41/partial_park.zig
+@@ -0,0 +1,128 @@
++//! Selective extension retention, based on Sushi b68302a dsv41_borrow.releaseCount.
++//! MIT reference is pinned under the research folder upstream-b68302a/LICENSE.
++//! This is only a release PLAN. Only a new live measurement can admit allocations.
++const std=@import("std");
++pub const PoolCost=struct{logical:u64,backing:u64};
++
++/// Plan against BOTH native process cost and box usage. `projector` supplies
++/// the unchanged native bill with only released persistent payload removed.
++/// Saturation is used only in this plan; the final gate must use real readings.
++pub fn releaseCountFor(pools:[]const PoolCost,box_used:?u64,added:u64,box_limit:u64,process_limit:u64,projector:anytype) ?usize {
++    const used=box_used orelse return null;
++    if(added>box_limit)return null;
++    var logical:u64=0;var backing:u64=0;
++    for(0..pools.len+1) |n| {
++        if(fits(used-|backing,added,box_limit) and projector.processAfterRemoving(logical)<=process_limit)return n;
++        if(n==pools.len)break;
++        logical+|=pools[n].logical;backing+|=pools[n].backing;
++    }
++    return null;
++}
++
++/// `pools` are in release order (latest layer first). Unknown box usage or an
++/// impossible positive increment is never converted into usable headroom.
++pub fn releaseCount(pools:[]const u64, box_used:?u64, added:u64, box_limit:u64) ?usize {
++    const used=box_used orelse return null;
++    if(added>box_limit)return null;
++    const maximum_used=box_limit-added;
++    if(used<=maximum_used)return 0;
++    const need=used-maximum_used;
++    var released:u64=0;
++    for(pools,0..) |bytes,i| {
++        released +|= bytes;
++        if(released>=need)return i+1;
++    }
++    return null;
++}
++
++pub fn fits(box_used:?u64,added:u64,limit:u64) bool {
++    const used=box_used orelse return false;
++    return added<=limit and used<=limit-added;
++}
++
++pub const Refresh=struct{used:?u64=null,waited_ms:u64=0,samples:u32=0};
++/// Darwin rate-limits host_statistics64 for ordinary processes (the SDK warns
++/// about2..10reads/s). A process-footprint fence does not refresh the box-wide
++/// cached counters. Space box reads at500ms; never turn expected frees into a
++/// lower used value. At most1second of additional waiting, as in author's
++/// waitForUnwire, before the caller re-plans against the reported real usage.
++pub fn refreshAfterRelease(context:anytype,before:?u64,freed:u64,added:u64,limit:u64) Refresh {
++    var result:Refresh=.{};
++    var last_sample:u64=0;
++    for(0..2) |_| {
++        const now=context.elapsedMs();
++        const due=last_sample+500;
++        if(now<due){context.wait(due-now);result.waited_ms+=due-now;}
++        result.used=context.read();result.samples+=1;
++        last_sample=context.elapsedMs();
++        if(fits(result.used,added,limit))break;
++        if(before) |old| if(result.used) |current| {
++            if(old-|current>=freed-freed/10)break;
++        };
++    }
++    return result;
++}
++
++test "partial park: global refresh waits for stale samples instead of discarding more owners" {
++    const Fake=struct{
++        time:u64=0,readings:[2]?u64,reads:usize=0,at:[2]u64=undefined,
++        pub fn elapsedMs(c:*@This())u64{return c.time;}
++        pub fn wait(c:*@This(),ms:u64)void{c.time+=ms;}
++        pub fn read(c:*@This())?u64{c.at[c.reads]=c.time;defer c.reads+=1;return c.readings[c.reads];}
++    };
++    var stale:Fake=.{.time=20,.readings=.{19,15}};
++    const r=refreshAfterRelease(&stale,19,4,5,20);
++    try std.testing.expectEqual(@as(?u64,15),r.used);
++    try std.testing.expectEqual(@as(u64,980),r.waited_ms);
++    try std.testing.expectEqualSlices(u64,&.{500,1000},&stale.at);
++    var already_waited:Fake=.{.time=800,.readings=.{15,15}};
++    const immediate=refreshAfterRelease(&already_waited,19,4,5,20);
++    try std.testing.expectEqual(@as(u64,0),immediate.waited_ms);
++    var slow:Fake=.{.time=800,.readings=.{19,15}};
++    _=refreshAfterRelease(&slow,19,4,5,20);
++    try std.testing.expectEqualSlices(u64,&.{800,1300},&slow.at);
++    var unknown:Fake=.{.readings=.{null,null}};
++    const invalid=refreshAfterRelease(&unknown,19,4,5,20);
++    try std.testing.expect(!fits(invalid.used,5,20));
++    var pressure:Fake=.{.readings=.{18,18}};
++    const grew=refreshAfterRelease(&pressure,19,4,5,20);
++    try std.testing.expect(!fits(grew.used,5,20));
++}
++
++test "partial park: plan matches the captured245310 pressure without changing limits" {
++    const each:u64=65*13315584;
++    const pools:[40]u64=@splat(each);
++    try std.testing.expectEqual(@as(?usize,8),releaseCount(&pools,195851862016,14928093704,190<<30));
++    try std.testing.expectEqual(@as(?usize,10),releaseCount(&pools,196935630848,14928093704,190<<30));
++    try std.testing.expectEqual(@as(?usize,0),releaseCount(&pools,180<<30,10<<30,190<<30));
++    try std.testing.expectEqual(@as(?usize,null),releaseCount(&pools,null,1,190<<30));
++    try std.testing.expectEqual(@as(?usize,null),releaseCount(&pools,0,(190<<30)+1,190<<30));
++    try std.testing.expectEqual(@as(?usize,null),releaseCount(&.{3,2},10,6,10));
++    try std.testing.expect(!fits(std.math.maxInt(u64),1,std.math.maxInt(u64)));
++    try std.testing.expect(fits(0,std.math.maxInt(u64),std.math.maxInt(u64)));
++}
++
++test "partial park: planned frees never satisfy the live allocation predicate" {
++    const planned=releaseCount(&.{4,4,4},19,5,20).?;
++    try std.testing.expectEqual(@as(usize,1),planned);
++    // The driver still owns the pages despite releasing one logical owner.
++    try std.testing.expect(!fits(19,5,20));
++    // Actual reads showing delayed reclamation, then another process growing.
++    try std.testing.expect(!fits(16,5,20));
++    try std.testing.expect(fits(15,5,20));
++    try std.testing.expect(!fits(18,5,20));
++    try std.testing.expectEqual(@as(?usize,1),releaseCount(&.{4,4},18,5,20));
++}
++
++test "partial park: native process limit can require more releases than box limit" {
++    const Projector=struct{
++        initial:u64=18,
++        floor:u64=6,
++        pub fn processAfterRemoving(p:@This(),bytes:u64)u64{return @max(p.floor,p.initial-|bytes);}
++    };
++    const pools=[_]PoolCost{.{.logical=3,.backing=4},.{.logical=3,.backing=4},.{.logical=3,.backing=4}};
++    try std.testing.expectEqual(@as(?usize,1),releaseCountFor(&pools,19,5,20,16,Projector{}));
++    try std.testing.expectEqual(@as(?usize,2),releaseCountFor(&pools,19,5,20,12,Projector{}));
++    try std.testing.expectEqual(@as(?usize,null),releaseCountFor(&pools,19,5,20,5,Projector{}));
++    try std.testing.expectEqual(@as(?usize,null),releaseCountFor(&pools,null,5,20,16,Projector{}));
++}
+diff --git a/src/expert/bank.zig b/src/expert/bank.zig
+index 0a02a5b..94f018b 100644
+--- a/src/expert/bank.zig
++++ b/src/expert/bank.zig
+@@ -968,6 +968,18 @@ pub const SynthBank = struct {
+     image: []u8,
+     bank: Bank,
+ 
++    /// Tiny heterogeneous fixture for ownership and partial-pool tests.
++    pub fn openMixed(n_experts: u32, reverse: bool) !SynthBank {
++        var tmp = std.testing.tmpDir(.{});
++        errdefer tmp.cleanup();
++        const image = try writeSynth(testing.allocator, &tmp, .{ .n_experts=n_experts, .k=if(reverse) &.{2,3} else &.{3,2} });
++        errdefer testing.allocator.free(image);
++        var rbuf:[512]u8=undefined;
++        const implemented:Implemented=.{.codebooks=&.{"mul1"},.k=&.{2,3},.hidden=64,.inter=32,.n_experts=n_experts,.n_layers=2};
++        const bank=try Bank.open(testing.allocator,std.testing.io,try tmpRoot(&tmp,&rbuf),implemented,null);
++        return .{.tmp=tmp,.image=image,.bank=bank};
++    }
++
+     pub fn open(n_experts: u32) !SynthBank {
+         var tmp = std.testing.tmpDir(.{});
+         errdefer tmp.cleanup();
+diff --git a/src/expert/stream.zig b/src/expert/stream.zig
+index 8487b44..b191b46 100644
+--- a/src/expert/stream.zig
++++ b/src/expert/stream.zig
+@@ -253,6 +253,12 @@ pub const StreamSource = struct {
+     pub fn discardParked(self: *StreamSource) !u64 {
+         return self.stream.discardParked();
+     }
++    pub fn discardParkedLayer(self: *StreamSource, layer: u32) !PoolBytes {
++        return self.stream.discardParkedLayer(layer);
++    }
++    pub fn extPoolBytesPerLayer(self: *const StreamSource, expected_extra: u32, out: []PoolBytes) !void {
++        return self.stream.extPoolBytesPerLayer(expected_extra, out);
++    }
+     pub fn hasParked(self: *const StreamSource) bool {
+         return self.stream.hasParked();
+     }
+@@ -2946,6 +2952,69 @@ test "parked ext lifecycle: changed geometry and allocation failure preserve sol
+ }
+ 
+ // Independent bank bytes, not mapping equality alone, prove the retained records are still correct.
++test "partial park: mixed retained and evicted layer owners preserve exact bytes and refill only evicted records" {
++    for([_]bool{false,true}) |reverse| {
++    var sb = try SynthBank.openMixed(32,reverse); defer sb.close();
++    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows=&.{4,2}, .max_route_ids=12, .transient_rows=24, .wide_depth=2, .pool=test_pool, .transient_release=true, .grow_fill=.unfilled, .keep_parked_records=true, .copy_parked_records=true });
++    defer s.deinit();
++    _=try s.releaseTransient();try s.grow(&.{12,10});
++    for(0..2) |l| {
++        const r=try serve(s,@intCast(l),&.{1,2,3,4,5,6,7,8,9,10});
++        try expectServed(s,&sb,r,&.{1,2,3,4,5,6,7,8,9,10});s.release(r);
++    }
++    try s.flush();
++    var old_ext:[2][12]u16=undefined;var n_ext=[_]usize{0,0};
++    for(s.layers,0..) |ls,l| {
++        for(ls.meta[ls.base.rows..ls.policy.capacity]) |m| if(m.state==.ready) {
++            old_ext[l][n_ext[l]]=m.expert;n_ext[l]+=1;
++        };
++        try testing.expect(n_ext[l]>=3);
++    }
++    var costs:[2]PoolBytes=undefined;try s.extPoolBytesPerLayer(8,&costs);
++    try testing.expect(sb.bank.layers[0].k!=sb.bank.layers[1].k);
++    try testing.expect(costs[0].logical!=costs[1].logical);
++    try testing.expectError(error.InvalidRows,s.extPoolBytesPerLayer(7,&costs));
++    try testing.expectError(error.PoolOwnerConflict,s.discardParkedLayer(1));
++    const keep_pointer=s.layers[0].ext.?.base;
++    _=try s.parkForPrompt(&.{4,2},.keep);
++    try s.extPoolBytesPerLayer(8,&costs);
++    const freed=try s.discardParkedLayer(1);
++    try testing.expectEqual(costs[1],freed);
++    try testing.expectEqual(PoolBytes{},try s.discardParkedLayer(1));
++    try testing.expect(s.hasParked());
++    try testing.expect(s.layers[1].parked_ext==null);
++    try testing.expectEqualSlices(u64,&keep_pointer,&s.layers[0].parked_ext.?.base);
++    for(s.layers[1].meta[s.layers[1].base.rows..]) |m| try testing.expect(m.state==.empty and m.pins==0);
++    var remaining:[2]PoolBytes=undefined;try s.extPoolBytesPerLayer(8,&remaining);
++    try testing.expectEqual(costs[0],remaining[0]);try testing.expectEqual(PoolBytes{},remaining[1]);
++    _=try s.regrowTransient();
++    const duplicate=old_ext[0][0];try s.seedPrefill(0,&.{duplicate});
++    const pr=try serve(s,0,&.{duplicate});try expectServed(s,&sb,pr,&.{duplicate});
++    try testing.expectEqual(@as(u64,0),readsOf(pr));s.release(pr);try s.flush();
++    const base_slot=s.layers[0].policy.slotOf(duplicate).?;
++    try testing.expect(base_slot<s.layers[0].base.rows);
++    _=try s.releaseTransient();
++    // Refusal happens before any retained owner moves or a replacement commits.
++    try testing.expectError(error.InvalidParkedRows,s.grow(&.{13,10}));
++    try testing.expectEqualSlices(u64,&keep_pointer,&s.layers[0].parked_ext.?.base);
++    try s.grow(&.{12,10});
++    try testing.expectEqual(costs[0],s.poolReuseStats().reused);
++    try testing.expectEqual(costs[1],s.poolReuseStats().new);
++    try testing.expectEqual(base_slot,s.layers[0].policy.slotOf(duplicate).?);
++    for(0..2) |l| {
++        const r=try serve(s,@intCast(l),old_ext[l][0..n_ext[l]]);
++        try expectServed(s,&sb,r,old_ext[l][0..n_ext[l]]);
++        if(l==0)try testing.expectEqual(@as(u64,0),readsOf(r)) else try testing.expect(readsOf(r)>0);
++        s.release(r);try s.flush();
++    }
++    // Cancellation/fallback: every remaining inaccessible owner is freed once.
++    _=try s.parkForPrompt(&.{4,2},.keep);
++    _=try s.discardParkedLayer(1);_=try s.discardParked();
++    try testing.expect(!s.hasParked());
++    try testing.expectEqual(@as(u64,0),try s.discardParked());
++    }
++}
++
+ test "parked records: inactive until grow, duplicate base copy wins, reactivated records avoid reads" {
+     var sb = try SynthBank.open(32);
+     defer sb.close();
+diff --git a/src/sdk_ext/expert/stream.zig b/src/sdk_ext/expert/stream.zig
+index 7c513e0..d4b164c 100644
+--- a/src/sdk_ext/expert/stream.zig
++++ b/src/sdk_ext/expert/stream.zig
+@@ -3159,6 +3159,51 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
+                 return false;
+             }
+ 
++            /// CPU-only inventory, with the exact geometry checked before an
++            /// admission planner may count any owner. Missing layers are zero.
++            pub fn extPoolBytesPerLayer(self: *const Stream, expected_extra: u32, out: []PoolBytes) !void {
++                if (out.len != self.layers.len) return error.InvalidRows;
++                for (self.layers, self.bank.layers, out) |*ls, *geom, *cost| {
++                    if (ls.ext != null and ls.parked_ext != null) return error.PoolOwnerConflict;
++                    if (ls.base.rows > ls.policy.n_experts or expected_extra > ls.policy.n_experts - ls.base.rows) return error.InvalidRows;
++                    const capacity = if (self.phase == .decode) ls.base.rows + expected_extra else ls.base.rows;
++                    if (ls.policy.capacity != capacity) return error.InvalidRows;
++                    cost.* = .{};
++                    if (ls.ext) |*owner| {
++                        if (!owner.matches(geom, expected_extra)) return error.InvalidParkedRows;
++                        cost.* = try owner.poolBytes(geom);
++                    }
++                    if (ls.parked_ext) |*owner| {
++                        if (!owner.matches(geom, expected_extra)) return error.InvalidParkedRows;
++                        cost.* = try owner.poolBytes(geom);
++                    }
++                }
++            }
++
++            /// Drop one inaccessible parked owner, after caller GPU quiescence.
++            /// Other layers and every base policy/owner stay intact. A later
++            /// grow already supports this mix of retained and new extensions.
++            pub fn discardParkedLayer(self: *Stream, layer: u32) !PoolBytes {
++                if (std.Thread.getCurrentId() != self.owner) return error.NotInferenceThread;
++                if (layer >= self.layers.len) return error.InvalidRows;
++                if (self.phase != .prefill) return error.PoolOwnerConflict;
++                for (self.layers) |ls| if (ls.ext != null) return error.PoolOwnerConflict;
++                if (self.layers[layer].parked_ext == null) return .{};
++                try self.settleRoutes();
++                const ls = &self.layers[layer];
++                const cost = try ls.parked_ext.?.poolBytes(&self.bank.layers[layer]);
++                const before = if (self.memory == .mlx) mlxActive() else 0;
++                ls.parked_ext.?.deinit();
++                ls.parked_ext = null;
++                @memset(ls.meta[ls.base.rows..], .{});
++                self.last_pool_transition = .{ .released = cost };
++                if (self.memory == .mlx and before -| mlxActive() < cost.backing) {
++                    self.failed = true;
++                    return error.ParkedRowsStillReferenced;
++                }
++                return cost;
++            }
++
+             /// Active ext or parked ext, never both; query is CPU-only and never evaluates a lazy array.
+             pub fn extPoolBytes(self: *const Stream) !PoolBytes {
+                 var cost: PoolBytes = .{};

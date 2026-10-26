@@ -1,0 +1,47 @@
+M2 Ultra + DeepSeek-V4.1-Flash-1017 EXL3 EAQ v1 2.9 bpw
+Maintained by chenwenhao0326-arch.
+
+This is an independent deployment and engineering adaptation. It is not an
+official DeepSeek, Apple, mlx-serve, mlx-stream, Sushi or Mia-AiLab release.
+
+Core engine:
+  mlx-serve — David Dalcu and contributors
+  https://github.com/ddalcu/mlx-serve
+  Pinned 94670d961c5b6934dc8d91c7b8be68bf44b60981.
+  MIT plus upstream third-party notices, reproduced under licenses/.
+  Local changes include plugin host seams, text/agent protocol compatibility,
+  request shaping, and frontend stream timeout handling.
+
+Streaming plugin:
+  mlx-stream — David Tai and contributors
+  https://github.com/davidtai/mlx-stream
+  Pinned fcb4011347ff80eeeb19e2a1f0180e13199c7c8b.
+  MIT; its complete NOTICE is reproduced under licenses/.
+  Local changes include native state/prefix reuse, prefill/cache scheduling,
+  measured M2 kernel integration and selective extension-cache retention.
+
+Method and implementation references:
+  Sushi — https://github.com/beamivalice/sushi (MIT)
+  M2 SIMD adaptation references 3f3ff7bcf4775ae2e88a8e9c36d2715fcfd9f7cf.
+  Selective cache-release planning references b68302a1469ed7d2dab03530cc10c6e2685f2a0a,
+  src/dsv41_borrow.zig, Engine.borrowLayer and Engine.restoreLayer.
+  The local EXL3 implementation releases inactive extension owners, retaining
+  the base pool and original native memory bill. It does not copy STQ weights
+  or claim the author's M5/STQ performance on M2/EXL3.
+  M2 decode grouping also references Strata's load-reuse methodology; exact
+  inherited attributions and license texts are in licenses/m2-adapter-NOTICE.txt.
+
+Generated Metal/C adapter:
+  Includes code derived from Apple MLX, mlx-stream, Sushi and other sources
+  enumerated in licenses/m2-adapter-NOTICE.txt and mlx-serve-NOTICE.txt.
+  MIT and applicable Apache-2.0 notices are retained in licenses/.
+
+Model provenance (weights are obtained separately):
+  DeepSeek-AI: DeepSeek-V4.1-Flash-1017 original model.
+  Mia-AiLab: EXL3 EAQ v1 2.9-bpw quantization, using ExLlamaV3 by turboderp.
+  OpensourceWTF: streaming repack consumed by this runtime.
+  Exact repositories and revisions are recorded in sources.lock.json.
+  We did not train, quantize or author these model weights.
+
+Local engineering and packaging were developed with AI coding assistance.
+Benchmarks are local observations with recorded conditions, not guarantees.

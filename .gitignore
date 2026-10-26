@@ -1,0 +1,16 @@
+_work/
+.local/
+dist/
+models/
+logs/
+results/
+*.dylib
+*.metallib
+*.safetensors
+*.gguf
+*.bin
+__pycache__/
+.DS_Store
+.env
+.env.*
+!config/*.example.json

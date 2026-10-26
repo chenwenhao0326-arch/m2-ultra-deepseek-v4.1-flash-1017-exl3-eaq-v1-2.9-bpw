@@ -1,0 +1,73 @@
+mlx-stream
+Copyright (c) 2026 David Tai
+
+mlx-stream as a whole is distributed under the MIT License (see LICENSE). It
+incorporates or is derived from third-party material that remains under its own
+license, listed below. Those licenses continue to apply to those portions.
+The source comments at each site name their upstream too.
+
+mlx-stream is a plugin for mlx-serve (https://github.com/ddalcu/mlx-serve,
+Copyright (c) 2026 David Dalcu, MIT). It was split out of a fork of mlx-serve;
+the files it shares with the host's SDK seams (sdk/check.zig, the
+no-cache read helpers in sdk/io_util.zig and the n-gram table in
+src/ngram_table.zig) were written for that fork by this repository's author,
+and so was sdk/ (the arch contract, the weight loader and the reads past the
+page cache), mlx-serve's plugin SDK in that fork, now kept here.
+
+The DeepSeek-V4.1 streaming runtime this plugin was ported from (the packed
+expert record and manifest formats, the streamed-bank layout read by
+src/expert/bank.zig and the routed-expert EXL3 Metal kernels pinned under
+src/kernels/exl3/) is this repository's author's own earlier work, written in
+Python; it is the plugin's parity oracle. It is Copyright (c) 2026 David Tai
+and is distributed here under the MIT License.
+
+================================================================================
+MIT License
+================================================================================
+
+--------------------------------------------------------------------------------
+MLX
+https://github.com/ml-explore/mlx
+Copyright (c) 2023-2025 Apple Inc.
+Licensed under the MIT License.
+
+The Metal kernel texts under src/kernels/exl3/ inline MLX's steel headers
+(`steel/defines.h`, `steel/utils/type_traits.h` and their siblings), each
+section marked with its MLX source path and copyright line. csrc/mlx_event_shim.cpp
+and csrc/mlx_alloc_shim.cpp compile against the host's staged MLX and mlx-c
+private headers.
+
+--------------------------------------------------------------------------------
+ExLlamaV3
+https://github.com/turboderp-org/exllamav3
+Copyright (c) turboderp
+Licensed under the MIT License.
+
+The EXL3 format this plugin reads (the mul1 codebook, the trellis packing, the
+tensor-core permutation and the Hadamard suh / svh transforms) follows
+exllamav3 v1.4.2 (codebook.cuh, exl3_dq.cuh, pack.cu, hadamard.cu,
+quantize.py); src/exl3/quant.zig and src/exl3/kernels.zig cite the lines they
+reproduce.
+
+--------------------------------------------------------------------------------
+DeepSeek-V4.1-Flash
+The DeepSeek-V4.1-Flash release's `inference/model.py` is the reference for the
+`deepseek_v41` architecture. No model weights are included in this repository.
+
+The reference fixtures src/fixtures/dsv41_official_engram.json and
+src/fixtures/dsv41_independent_dequant.json
+and scripts/dump_dsv41_reference_fixtures.py use the official Engram CPU forward
+and stored FP8/FP4 decoding specification at revision
+2cba9e42aa026125f3ed06c6d98c1db82f7ca027:
+https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+Copyright (c) 2023 DeepSeek, MIT License: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/LICENSE
+(its permission notice and disclaimer apply). The official code is loaded
+externally by the dumper, not vendored; the fixtures hold synthetic inputs, the
+official hash tables and expected rows.
+
+These fixtures and their dumper are adapted from Sushi's independent
+DeepSeek-V4.1 consumer fixtures (MIT):
+Copyright (c) 2026 Theinruj Toranavikrai
+Copyright (c) 2026 David Dalcu
+They contain synthetic numerical inputs and tokenizer-derived hash metadata,
+not model weights or conversion tools.

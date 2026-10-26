@@ -1,0 +1,482 @@
+{
+  "schema": 1,
+  "hardware": {
+    "chip": "Apple M2 Ultra",
+    "gpu_cores": 76,
+    "unified_memory_gib": 192,
+    "macos": "26.4.1"
+  },
+  "model": {
+    "repository": "OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3-2.9bpw",
+    "revision": "3ef807df042b7069ccefc0957b6df5ff5fa9267f"
+  },
+  "configuration": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "seed": 42,
+    "thinking": "disabled",
+    "context_tokens": 262144,
+    "prefill_rows": 224,
+    "decode_rows": 288,
+    "warmup": "One fixed1..30 counting prompt, outputcap80,seed123",
+    "order": "Fresh baseline A then optimized B",
+    "cold_namespaces": "Separate native SSDsessioncache namespace for each arm",
+    "output_caps": [
+      1024,
+      1024,
+      512
+    ]
+  },
+  "same_inputs": {
+    "text": true,
+    "code": true,
+    "followup": true
+  },
+  "same_outputs": {
+    "text": true,
+    "code": true,
+    "followup": true
+  },
+  "runs": [
+    {
+      "arm": "A",
+      "binary_sha256": "2dbdcc50f317c31a9138bc28beae4e680f068988fb7ddceddaeda32f3a63c966",
+      "kernel_sha256": "3d4bd6e7d4bb2fa80320c71f9c40061a42e92d3c10e9187edad1b00f4fc3a15b",
+      "peak_accounted_gib": 157.16076589375734,
+      "swap_delta": 0.0,
+      "guard": [],
+      "elapsed_sum_s": 104.15210158299999,
+      "requests": [
+        {
+          "label": "text",
+          "elapsed_s": 49.829719291,
+          "ttft_s": 2.6987002910000086,
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 1024,
+            "total_tokens": 1073,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "prompt_n": 49,
+            "cached_n": 0,
+            "prompt_ms": 2696.563,
+            "prompt_per_second": 18.171,
+            "predicted_n": 1024,
+            "predicted_ms": 47038.515,
+            "predicted_per_second": 21.769,
+            "tokenize_ms": 1.031
+          },
+          "finish_reason": "length",
+          "output_sha256": "822ccec7fce23a017acd2a3f35eba5b1d2c5b8ca14b3a4682e74082f76122da3",
+          "request_sha256": "9535e86d72aa81025e27f9c4292a982325c8cae2f7ea72e9b7a83a15d91d4528",
+          "output": "# 打开一个 HTTPS 网页：DNS、TCP、TLS、HTTP 各自在做什么\n\n作为后端工程师，我们每天都在写接口、调 RPC、配网关，但\"浏览器输入 URL 到页面渲染\"这条链路上每个协议的分工，很多人其实是模糊的。下面用一个具体例子贯穿讲解：你在浏览器输入 `https://api.example.com/orders`，后端是 Nginx + Spring Boot，前面挂 CDN。\n\n## 一、DNS：把域名翻译成 IP\n\nDNS 解决的是\"名字 → 地址\"的映射问题。浏览器拿到 `api.example.com` 后，先查本地缓存（浏览器 DNS 缓存、OS 缓存、hosts 文件），没有则向递归解析器（通常是运营商或 8.8.8.8）发起查询。递归解析器依次问根服务器 → `.com` TLD 服务器 → `example.com` 的权威服务器，最终拿到 A/AAAA 记录，比如 `203.0.113.10`。\n\n对后端工程师而言，DNS 有几个实际影响点：\n\n1. **DNS 也是网络请求**，一次冷查询可能 20–120ms，取决于递归深度和 RTT。这就是为什么浏览器会预取（`<link rel=\"dns-prefetch\">`）。\n2. **DNS 可以做负载均衡和故障转移**：权威服务器可以返回多个 A 记录，客户端轮询；也可以配合健康检查做 failover。但 DNS 的 TTL 缓存让切换有延迟，TTL 设太长故障切换慢，设太短查询压力大——这是运维要权衡的。\n3. **CDN 的核心机制就是 DNS 调度**：权威 DNS 根据解析器出口 IP 的地理位置返回最近的边缘节点 IP。你请求 `api.example.com` 拿到的可能不是源站，而是上海/新加坡的边缘节点。\n\n## 二、TCP：建立可靠的字节流通道\n\n拿到 IP 后，浏览器与目标（比如 CDN 边缘节点）建立 TCP 连接。经典三次握手：\n\n```\nClient → Server: SYN (seq=x)\nServer → Client: SYN-ACK (seq=y, ack=x+1)\nClient → Server: ACK (ack=y+1)\n```\n\n**关键点：三次握手消耗 1 个 RTT**。如果客户端在北京、边缘节点在上海，RTT 约 20ms，握手就花 20ms；如果直连美国源站，RTT 150ms，握手就 150ms。这就是 CDN 存在的意义之一——缩短 RTT。\n\nTCP 提供的是**可靠、有序的字节流**：丢包重传、拥塞控制、流量控制都在这一层。HTTP 和 TLS 都跑在它上面，所以它们看到的不是\"消息\"，而是\"字节流\"，必须自己定义边界（HTTP/1.1 靠 Content-Length 或 chunked，TLS 靠 record 长度字段）。\n\n后端视角：TCP 连接是有成本的——内核要为每个连接维护 socket、缓冲区、拥塞窗口状态。高并发服务要考虑 `somaxconn`、文件描述符上限、TIME_WAIT 回收（`tcp_tw_reuse`）等。长连接能大幅降低这种成本。\n\n## 三、TLS：在字节流上加密并认证\n\nTCP 通道建好后，浏览器开始 TLS 握手（以 TLS 1.3 为例，1-RTT）：\n\n1. **ClientHello**：客户端发送支持的密码套件、TLS 版本、SNI（`api.example.com`，让同一 IP 上的服务器知道该用哪张证书）、key_share（DH 公钥）。\n2. **ServerHello + 证书 + Finished**：服务器选好套件，返回自己的 key_share、证书链（含域名、有效期、签发 CA、公钥）、并用握手密钥加密的 Finished。\n3. **客户端验证证书**：检查域名是否匹配、是否过期、是否由受信任 CA 签发、是否被吊销（CRL/OCSP）。验证失败浏览器直接报错。\n4. **双方用 DH 交换算出会话密钥**，之后所有应用数据用对称加密（AES-GCM/ChaCha20）传输。\n\nTLS 1.3 把密钥交换和认证合并，**握手只需 1 RTT**（TLS 1.2 要 2 RTT）。再加上 **Session Resumption / PSK**，回连时可以做到 0-RTT（严格说是 0-RTT 数据 + 1-RTT 完成握手）。\n\nTLS 解决三件事：**机密性**（窃听者看不到明文）、**完整性**（篡改会被 MAC 发现）、**身份认证**（证书证明你连的确实是 example.com，而不是中间人）。\n\n后端视角：TLS 终止通常在 Nginx/AL",
+          "request": {
+            "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+            "messages": [
+              {
+                "role": "user",
+                "content": "请面向后端工程师详细解释DNS、TCP、TLS和HTTP在打开一个HTTPS网页时各自做什么，连接复用如何降低延迟，缓存在哪些步骤生效。用具体例子，至少1000字。"
+              }
+            ],
+            "thinking": {
+              "type": "disabled"
+            },
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "seed": 42,
+            "max_tokens": 1024,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        },
+        {
+          "label": "code",
+          "elapsed_s": 33.680606667000006,
+          "ttft_s": 2.6691590000000076,
+          "usage": {
+            "prompt_tokens": 54,
+            "completion_tokens": 912,
+            "total_tokens": 966,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "prompt_n": 54,
+            "cached_n": 0,
+            "prompt_ms": 2667.165,
+            "prompt_per_second": 20.246,
+            "predicted_n": 912,
+            "predicted_ms": 30781.618,
+            "predicted_per_second": 29.628,
+            "tokenize_ms": 0.85
+          },
+          "finish_reason": "stop",
+          "output_sha256": "1fe2dc0bdddf34da4cf6bfbe3b9092af3c8d045dd0bfab71af350167e691405c",
+          "request_sha256": "91cde79cbc745603f8cfe421c79a4f41cfe2c5df647a3eb8e3d8a76d7b505883",
+          "output": "```python\nimport asyncio\nimport random\nfrom dataclasses import dataclass, field\nfrom typing import Any, Awaitable, Callable, List, Optional\n\n\n@dataclass\nclass TaskResult:\n    index: int\n    ok: bool\n    value: Any = None\n    error: Optional[BaseException] = None\n    timed_out: bool = False\n\n\nclass BoundedAsyncPool:\n    \"\"\"有界异步任务池：限制并发、保留输入顺序、支持单任务超时与错误收集。\"\"\"\n\n    def __init__(self, concurrency: int = 5, timeout: Optional[float] = None):\n        if concurrency <= 0:\n            raise ValueError(\"concurrency must be > 0\")\n        self.concurrency = concurrency\n        self.timeout = timeout\n        self._sem = asyncio.Semaphore(concurrency)\n        self._errors: List[TaskResult] = []\n\n    async def _run_one(\n        self,\n        index: int,\n        fn: Callable[..., Awaitable[Any]],\n        args: tuple,\n        kwargs: dict,\n        timeout: Optional[float],\n    ) -> TaskResult:\n        async with self._sem:\n            try:\n                if timeout is None:\n                    value = await fn(*args, **kwargs)\n                else:\n                    value = await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)\n                return TaskResult(index=index, ok=True, value=value)\n            except asyncio.TimeoutError as e:\n                return TaskResult(index=index, ok=False, error=e, timed_out=True)\n            except BaseException as e:  # 收集所有异常，不中断整体\n                return TaskResult(index=index, ok=False, error=e)\n\n    async def run(\n        self,\n        tasks: List[Callable[..., Awaitable[Any]]],\n        *,\n        timeout: Optional[float] = None,\n    ) -> List[TaskResult]:\n        \"\"\"并发执行任务，按输入顺序返回 TaskResult 列表。\"\"\"\n        if not tasks:\n            return []\n        timeout = self.timeout if timeout is None else timeout\n        coros = [\n            self._run_one(i, fn, (), {}, timeout)\n            for i, fn in enumerate(tasks)\n        ]\n        results = await asyncio.gather(*coros)\n        self._errors = [r for r in results if not r.ok]\n        return results\n\n    @property\n    def errors(self) -> List[TaskResult]:\n        return list(self._errors)\n\n\n# ---------------- 演示 ----------------\nasync def demo():\n    async def ok_task(i: int, delay: float) -> str:\n        await asyncio.sleep(delay)\n        return f\"task-{i}-done\"\n\n    async def fail_task(i: int) -> str:\n        await asyncio.sleep(0.05)\n        raise RuntimeError(f\"task-{i}-failed\")\n\n    async def slow_task(i: int) -> str:\n        await asyncio.sleep(5)\n        return f\"slow-{i}\"\n\n    # 用闭包包装不同任务，便于统一调用签名\n    tasks = [\n        lambda: ok_task(0, 0.1),\n        lambda: fail_task(1),\n        lambda: ok_task(2, 0.05),\n        lambda: slow_task(3),\n        lambda: ok_task(4, 0.2),\n    ]\n\n    pool = BoundedAsyncPool(concurrency=2, timeout=0.5)\n    results = await pool.run(tasks)\n\n    print(\"=== 结果（保持输入顺序）===\")\n    for r in results:\n        if r.ok:\n            print(f\"[{r.index}] OK -> {r.value}\")\n        else:\n            tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n            print(f\"[{r.index}] {tag} -> {r.error!r}\")\n\n    print(\"\\n=== 错误收集 ===\")\n    for r in pool.errors:\n        tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n        print(f\"[{r.index}] {tag}: {r.error!r}\")\n\n\nif __name__ == \"__main__\":\n    asyncio.run(demo())\n```",
+          "request": {
+            "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+            "messages": [
+              {
+                "role": "user",
+                "content": "只输出Python代码，实现一个有界异步任务池，使用asyncio.Semaphore限制并发，保留输入顺序返回结果，支持单任务超时和错误收集，并给出可运行的演示。实现完整，不调用工具。"
+              }
+            ],
+            "thinking": {
+              "type": "disabled"
+            },
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "seed": 42,
+            "max_tokens": 1024,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        },
+        {
+          "label": "followup",
+          "elapsed_s": 20.64177562499998,
+          "ttft_s": 2.4722172079999893,
+          "usage": {
+            "prompt_tokens": 1008,
+            "completion_tokens": 512,
+            "total_tokens": 1520,
+            "prompt_tokens_details": {
+              "cached_tokens": 967
+            }
+          },
+          "timings": {
+            "prompt_n": 1008,
+            "cached_n": 967,
+            "prompt_ms": 2469.278,
+            "prompt_per_second": 16.604,
+            "predicted_n": 512,
+            "predicted_ms": 18009.812,
+            "predicted_per_second": 28.429,
+            "tokenize_ms": 1.886
+          },
+          "finish_reason": "length",
+          "output_sha256": "c12a1ce842e72fc6c62d93b9813e38f57edcb8f6a302b1b3a7defd08a960c631",
+          "request_sha256": "f73e337d6cd92bf275ea1c9116f32f0f1f752e713fafd29074c4cef240d1f64b",
+          "output": "```python\nimport asyncio\nimport unittest\n\nfrom async_pool import BoundedAsyncPool, TaskResult\n\n\nclass TestBoundedAsyncPool(unittest.IsolatedAsyncioTestCase):\n    async def test_concurrency_limit(self):\n        \"\"\"并发数不超过 concurrency 上限。\"\"\"\n        running = 0\n        peak = 0\n        lock = asyncio.Lock()\n\n        async def tracked_task():\n            nonlocal running, peak\n            async with lock:\n                running += 1\n                if running > peak:\n                    peak = running\n            await asyncio.sleep(0.05)\n            async with lock:\n                running -= 1\n            return \"ok\"\n\n        tasks = [tracked_task for _ in range(10)]\n        pool = BoundedAsyncPool(concurrency=3)\n        results = await pool.run(tasks)\n\n        self.assertTrue(all(r.ok for r in results))\n        self.assertLessEqual(peak, 3)\n        self.assertGreater(peak, 0)\n\n    async def test_return_order_preserved(self):\n        \"\"\"结果按输入顺序返回，即使完成顺序不同。\"\"\"\n        async def make_task(delay, value):\n            async def _task():\n                await asyncio.sleep(delay)\n                return value\n            return _task\n\n        tasks = [\n            await make_task(0.15, \"a\"),\n            await make_task(0.01, \"b\"),\n            await make_task(0.05, \"c\"),\n            await make_task(0.02, \"d\"),\n        ]\n        pool = BoundedAsyncPool(concurrency=4)\n        results = await pool.run(tasks)\n\n        self.assertEqual([r.index for r in results], [0, 1, 2, 3])\n        self.assertEqual([r.value for r in results], [\"a\", \"b\", \"c\", \"d\"])\n        self.assertTrue(all(r.ok for r in results))\n\n    async def test_single_task_timeout(self):\n        \"\"\"单任务超时被正确标记，其他任务正常完成。\"\"\"\n        async def fast_task():\n            await asyncio.sleep(0.01)\n            return \"fast\"\n\n        async def slow_task():\n            await asyncio.sleep(1.0)\n            return \"slow\"\n\n        tasks = [fast_task, slow_task, fast_task]\n        pool = BoundedAsyncPool(concurrency=3, timeout=0.2)\n        results = await pool.run(t",
+          "request": {
+            "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+            "messages": [
+              {
+                "role": "user",
+                "content": "只输出Python代码，实现一个有界异步任务池，使用asyncio.Semaphore限制并发，保留输入顺序返回结果，支持单任务超时和错误收集，并给出可运行的演示。实现完整，不调用工具。"
+              },
+              {
+                "role": "assistant",
+                "content": "```python\nimport asyncio\nimport random\nfrom dataclasses import dataclass, field\nfrom typing import Any, Awaitable, Callable, List, Optional\n\n\n@dataclass\nclass TaskResult:\n    index: int\n    ok: bool\n    value: Any = None\n    error: Optional[BaseException] = None\n    timed_out: bool = False\n\n\nclass BoundedAsyncPool:\n    \"\"\"有界异步任务池：限制并发、保留输入顺序、支持单任务超时与错误收集。\"\"\"\n\n    def __init__(self, concurrency: int = 5, timeout: Optional[float] = None):\n        if concurrency <= 0:\n            raise ValueError(\"concurrency must be > 0\")\n        self.concurrency = concurrency\n        self.timeout = timeout\n        self._sem = asyncio.Semaphore(concurrency)\n        self._errors: List[TaskResult] = []\n\n    async def _run_one(\n        self,\n        index: int,\n        fn: Callable[..., Awaitable[Any]],\n        args: tuple,\n        kwargs: dict,\n        timeout: Optional[float],\n    ) -> TaskResult:\n        async with self._sem:\n            try:\n                if timeout is None:\n                    value = await fn(*args, **kwargs)\n                else:\n                    value = await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)\n                return TaskResult(index=index, ok=True, value=value)\n            except asyncio.TimeoutError as e:\n                return TaskResult(index=index, ok=False, error=e, timed_out=True)\n            except BaseException as e:  # 收集所有异常，不中断整体\n                return TaskResult(index=index, ok=False, error=e)\n\n    async def run(\n        self,\n        tasks: List[Callable[..., Awaitable[Any]]],\n        *,\n        timeout: Optional[float] = None,\n    ) -> List[TaskResult]:\n        \"\"\"并发执行任务，按输入顺序返回 TaskResult 列表。\"\"\"\n        if not tasks:\n            return []\n        timeout = self.timeout if timeout is None else timeout\n        coros = [\n            self._run_one(i, fn, (), {}, timeout)\n            for i, fn in enumerate(tasks)\n        ]\n        results = await asyncio.gather(*coros)\n        self._errors = [r for r in results if not r.ok]\n        return results\n\n    @property\n    def errors(self) -> List[TaskResult]:\n        return list(self._errors)\n\n\n# ---------------- 演示 ----------------\nasync def demo():\n    async def ok_task(i: int, delay: float) -> str:\n        await asyncio.sleep(delay)\n        return f\"task-{i}-done\"\n\n    async def fail_task(i: int) -> str:\n        await asyncio.sleep(0.05)\n        raise RuntimeError(f\"task-{i}-failed\")\n\n    async def slow_task(i: int) -> str:\n        await asyncio.sleep(5)\n        return f\"slow-{i}\"\n\n    # 用闭包包装不同任务，便于统一调用签名\n    tasks = [\n        lambda: ok_task(0, 0.1),\n        lambda: fail_task(1),\n        lambda: ok_task(2, 0.05),\n        lambda: slow_task(3),\n        lambda: ok_task(4, 0.2),\n    ]\n\n    pool = BoundedAsyncPool(concurrency=2, timeout=0.5)\n    results = await pool.run(tasks)\n\n    print(\"=== 结果（保持输入顺序）===\")\n    for r in results:\n        if r.ok:\n            print(f\"[{r.index}] OK -> {r.value}\")\n        else:\n            tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n            print(f\"[{r.index}] {tag} -> {r.error!r}\")\n\n    print(\"\\n=== 错误收集 ===\")\n    for r in pool.errors:\n        tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n        print(f\"[{r.index}] {tag}: {r.error!r}\")\n\n\nif __name__ == \"__main__\":\n    asyncio.run(demo())\n```"
+              },
+              {
+                "role": "user",
+                "content": "为上面的异步任务池补充一组unittest.IsolatedAsyncioTestCase测试，覆盖并发上限、返回顺序、超时和异常。只输出Python代码，不调用工具。"
+              }
+            ],
+            "thinking": {
+              "type": "disabled"
+            },
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "seed": 43,
+            "max_tokens": 512,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        }
+      ],
+      "retention": [
+        {
+          "total_prompt": 18,
+          "verified_query": null,
+          "selected": false,
+          "reason": "geometry",
+          "logical_bytes": 0,
+          "released_layers": null,
+          "box_refresh_wait_ms": null
+        },
+        {
+          "total_prompt": 49,
+          "verified_query": null,
+          "selected": false,
+          "reason": "geometry",
+          "logical_bytes": 0,
+          "released_layers": null,
+          "box_refresh_wait_ms": null
+        },
+        {
+          "total_prompt": 54,
+          "verified_query": null,
+          "selected": false,
+          "reason": "geometry",
+          "logical_bytes": 0,
+          "released_layers": null,
+          "box_refresh_wait_ms": null
+        },
+        {
+          "total_prompt": 1008,
+          "verified_query": {
+            "rows": 41,
+            "positions": 1008
+          },
+          "selected": false,
+          "reason": "geometry",
+          "logical_bytes": 0,
+          "released_layers": null,
+          "box_refresh_wait_ms": null
+        }
+      ]
+    },
+    {
+      "arm": "B",
+      "binary_sha256": "123d37603e34e461c35d94ae01bc159d0c2cc1a578934b09ba74fc339d1d0a3a",
+      "kernel_sha256": "3d4bd6e7d4bb2fa80320c71f9c40061a42e92d3c10e9187edad1b00f4fc3a15b",
+      "peak_accounted_gib": 157.13857959210873,
+      "swap_delta": 0.0,
+      "guard": [],
+      "elapsed_sum_s": 98.01670454100002,
+      "requests": [
+        {
+          "label": "text",
+          "elapsed_s": 47.87682070799997,
+          "ttft_s": 3.0102747500000078,
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 1024,
+            "total_tokens": 1073,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "prompt_n": 49,
+            "cached_n": 0,
+            "prompt_ms": 3008.457,
+            "prompt_per_second": 16.287,
+            "predicted_n": 1024,
+            "predicted_ms": 44768.385,
+            "predicted_per_second": 22.873,
+            "tokenize_ms": 0.726
+          },
+          "finish_reason": "length",
+          "output_sha256": "822ccec7fce23a017acd2a3f35eba5b1d2c5b8ca14b3a4682e74082f76122da3",
+          "request_sha256": "9535e86d72aa81025e27f9c4292a982325c8cae2f7ea72e9b7a83a15d91d4528",
+          "output": "# 打开一个 HTTPS 网页：DNS、TCP、TLS、HTTP 各自在做什么\n\n作为后端工程师，我们每天都在写接口、调 RPC、配网关，但\"浏览器输入 URL 到页面渲染\"这条链路上每个协议的分工，很多人其实是模糊的。下面用一个具体例子贯穿讲解：你在浏览器输入 `https://api.example.com/orders`，后端是 Nginx + Spring Boot，前面挂 CDN。\n\n## 一、DNS：把域名翻译成 IP\n\nDNS 解决的是\"名字 → 地址\"的映射问题。浏览器拿到 `api.example.com` 后，先查本地缓存（浏览器 DNS 缓存、OS 缓存、hosts 文件），没有则向递归解析器（通常是运营商或 8.8.8.8）发起查询。递归解析器依次问根服务器 → `.com` TLD 服务器 → `example.com` 的权威服务器，最终拿到 A/AAAA 记录，比如 `203.0.113.10`。\n\n对后端工程师而言，DNS 有几个实际影响点：\n\n1. **DNS 也是网络请求**，一次冷查询可能 20–120ms，取决于递归深度和 RTT。这就是为什么浏览器会预取（`<link rel=\"dns-prefetch\">`）。\n2. **DNS 可以做负载均衡和故障转移**：权威服务器可以返回多个 A 记录，客户端轮询；也可以配合健康检查做 failover。但 DNS 的 TTL 缓存让切换有延迟，TTL 设太长故障切换慢，设太短查询压力大——这是运维要权衡的。\n3. **CDN 的核心机制就是 DNS 调度**：权威 DNS 根据解析器出口 IP 的地理位置返回最近的边缘节点 IP。你请求 `api.example.com` 拿到的可能不是源站，而是上海/新加坡的边缘节点。\n\n## 二、TCP：建立可靠的字节流通道\n\n拿到 IP 后，浏览器与目标（比如 CDN 边缘节点）建立 TCP 连接。经典三次握手：\n\n```\nClient → Server: SYN (seq=x)\nServer → Client: SYN-ACK (seq=y, ack=x+1)\nClient → Server: ACK (ack=y+1)\n```\n\n**关键点：三次握手消耗 1 个 RTT**。如果客户端在北京、边缘节点在上海，RTT 约 20ms，握手就花 20ms；如果直连美国源站，RTT 150ms，握手就 150ms。这就是 CDN 存在的意义之一——缩短 RTT。\n\nTCP 提供的是**可靠、有序的字节流**：丢包重传、拥塞控制、流量控制都在这一层。HTTP 和 TLS 都跑在它上面，所以它们看到的不是\"消息\"，而是\"字节流\"，必须自己定义边界（HTTP/1.1 靠 Content-Length 或 chunked，TLS 靠 record 长度字段）。\n\n后端视角：TCP 连接是有成本的——内核要为每个连接维护 socket、缓冲区、拥塞窗口状态。高并发服务要考虑 `somaxconn`、文件描述符上限、TIME_WAIT 回收（`tcp_tw_reuse`）等。长连接能大幅降低这种成本。\n\n## 三、TLS：在字节流上加密并认证\n\nTCP 通道建好后，浏览器开始 TLS 握手（以 TLS 1.3 为例，1-RTT）：\n\n1. **ClientHello**：客户端发送支持的密码套件、TLS 版本、SNI（`api.example.com`，让同一 IP 上的服务器知道该用哪张证书）、key_share（DH 公钥）。\n2. **ServerHello + 证书 + Finished**：服务器选好套件，返回自己的 key_share、证书链（含域名、有效期、签发 CA、公钥）、并用握手密钥加密的 Finished。\n3. **客户端验证证书**：检查域名是否匹配、是否过期、是否由受信任 CA 签发、是否被吊销（CRL/OCSP）。验证失败浏览器直接报错。\n4. **双方用 DH 交换算出会话密钥**，之后所有应用数据用对称加密（AES-GCM/ChaCha20）传输。\n\nTLS 1.3 把密钥交换和认证合并，**握手只需 1 RTT**（TLS 1.2 要 2 RTT）。再加上 **Session Resumption / PSK**，回连时可以做到 0-RTT（严格说是 0-RTT 数据 + 1-RTT 完成握手）。\n\nTLS 解决三件事：**机密性**（窃听者看不到明文）、**完整性**（篡改会被 MAC 发现）、**身份认证**（证书证明你连的确实是 example.com，而不是中间人）。\n\n后端视角：TLS 终止通常在 Nginx/AL",
+          "request": {
+            "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+            "messages": [
+              {
+                "role": "user",
+                "content": "请面向后端工程师详细解释DNS、TCP、TLS和HTTP在打开一个HTTPS网页时各自做什么，连接复用如何降低延迟，缓存在哪些步骤生效。用具体例子，至少1000字。"
+              }
+            ],
+            "thinking": {
+              "type": "disabled"
+            },
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "seed": 42,
+            "max_tokens": 1024,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        },
+        {
+          "label": "code",
+          "elapsed_s": 31.91283900000002,
+          "ttft_s": 2.661021000000005,
+          "usage": {
+            "prompt_tokens": 54,
+            "completion_tokens": 912,
+            "total_tokens": 966,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "prompt_n": 54,
+            "cached_n": 0,
+            "prompt_ms": 2658.637,
+            "prompt_per_second": 20.311,
+            "predicted_n": 912,
+            "predicted_ms": 28984.895,
+            "predicted_per_second": 31.465,
+            "tokenize_ms": 0.898
+          },
+          "finish_reason": "stop",
+          "output_sha256": "1fe2dc0bdddf34da4cf6bfbe3b9092af3c8d045dd0bfab71af350167e691405c",
+          "request_sha256": "91cde79cbc745603f8cfe421c79a4f41cfe2c5df647a3eb8e3d8a76d7b505883",
+          "output": "```python\nimport asyncio\nimport random\nfrom dataclasses import dataclass, field\nfrom typing import Any, Awaitable, Callable, List, Optional\n\n\n@dataclass\nclass TaskResult:\n    index: int\n    ok: bool\n    value: Any = None\n    error: Optional[BaseException] = None\n    timed_out: bool = False\n\n\nclass BoundedAsyncPool:\n    \"\"\"有界异步任务池：限制并发、保留输入顺序、支持单任务超时与错误收集。\"\"\"\n\n    def __init__(self, concurrency: int = 5, timeout: Optional[float] = None):\n        if concurrency <= 0:\n            raise ValueError(\"concurrency must be > 0\")\n        self.concurrency = concurrency\n        self.timeout = timeout\n        self._sem = asyncio.Semaphore(concurrency)\n        self._errors: List[TaskResult] = []\n\n    async def _run_one(\n        self,\n        index: int,\n        fn: Callable[..., Awaitable[Any]],\n        args: tuple,\n        kwargs: dict,\n        timeout: Optional[float],\n    ) -> TaskResult:\n        async with self._sem:\n            try:\n                if timeout is None:\n                    value = await fn(*args, **kwargs)\n                else:\n                    value = await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)\n                return TaskResult(index=index, ok=True, value=value)\n            except asyncio.TimeoutError as e:\n                return TaskResult(index=index, ok=False, error=e, timed_out=True)\n            except BaseException as e:  # 收集所有异常，不中断整体\n                return TaskResult(index=index, ok=False, error=e)\n\n    async def run(\n        self,\n        tasks: List[Callable[..., Awaitable[Any]]],\n        *,\n        timeout: Optional[float] = None,\n    ) -> List[TaskResult]:\n        \"\"\"并发执行任务，按输入顺序返回 TaskResult 列表。\"\"\"\n        if not tasks:\n            return []\n        timeout = self.timeout if timeout is None else timeout\n        coros = [\n            self._run_one(i, fn, (), {}, timeout)\n            for i, fn in enumerate(tasks)\n        ]\n        results = await asyncio.gather(*coros)\n        self._errors = [r for r in results if not r.ok]\n        return results\n\n    @property\n    def errors(self) -> List[TaskResult]:\n        return list(self._errors)\n\n\n# ---------------- 演示 ----------------\nasync def demo():\n    async def ok_task(i: int, delay: float) -> str:\n        await asyncio.sleep(delay)\n        return f\"task-{i}-done\"\n\n    async def fail_task(i: int) -> str:\n        await asyncio.sleep(0.05)\n        raise RuntimeError(f\"task-{i}-failed\")\n\n    async def slow_task(i: int) -> str:\n        await asyncio.sleep(5)\n        return f\"slow-{i}\"\n\n    # 用闭包包装不同任务，便于统一调用签名\n    tasks = [\n        lambda: ok_task(0, 0.1),\n        lambda: fail_task(1),\n        lambda: ok_task(2, 0.05),\n        lambda: slow_task(3),\n        lambda: ok_task(4, 0.2),\n    ]\n\n    pool = BoundedAsyncPool(concurrency=2, timeout=0.5)\n    results = await pool.run(tasks)\n\n    print(\"=== 结果（保持输入顺序）===\")\n    for r in results:\n        if r.ok:\n            print(f\"[{r.index}] OK -> {r.value}\")\n        else:\n            tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n            print(f\"[{r.index}] {tag} -> {r.error!r}\")\n\n    print(\"\\n=== 错误收集 ===\")\n    for r in pool.errors:\n        tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n        print(f\"[{r.index}] {tag}: {r.error!r}\")\n\n\nif __name__ == \"__main__\":\n    asyncio.run(demo())\n```",
+          "request": {
+            "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+            "messages": [
+              {
+                "role": "user",
+                "content": "只输出Python代码，实现一个有界异步任务池，使用asyncio.Semaphore限制并发，保留输入顺序返回结果，支持单任务超时和错误收集，并给出可运行的演示。实现完整，不调用工具。"
+              }
+            ],
+            "thinking": {
+              "type": "disabled"
+            },
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "seed": 42,
+            "max_tokens": 1024,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        },
+        {
+          "label": "followup",
+          "elapsed_s": 18.227044833000036,
+          "ttft_s": 2.5458492500000034,
+          "usage": {
+            "prompt_tokens": 1008,
+            "completion_tokens": 512,
+            "total_tokens": 1520,
+            "prompt_tokens_details": {
+              "cached_tokens": 967
+            }
+          },
+          "timings": {
+            "prompt_n": 1008,
+            "cached_n": 967,
+            "prompt_ms": 2542.116,
+            "prompt_per_second": 16.128,
+            "predicted_n": 512,
+            "predicted_ms": 15523.728,
+            "predicted_per_second": 32.982,
+            "tokenize_ms": 2.27
+          },
+          "finish_reason": "length",
+          "output_sha256": "c12a1ce842e72fc6c62d93b9813e38f57edcb8f6a302b1b3a7defd08a960c631",
+          "request_sha256": "f73e337d6cd92bf275ea1c9116f32f0f1f752e713fafd29074c4cef240d1f64b",
+          "output": "```python\nimport asyncio\nimport unittest\n\nfrom async_pool import BoundedAsyncPool, TaskResult\n\n\nclass TestBoundedAsyncPool(unittest.IsolatedAsyncioTestCase):\n    async def test_concurrency_limit(self):\n        \"\"\"并发数不超过 concurrency 上限。\"\"\"\n        running = 0\n        peak = 0\n        lock = asyncio.Lock()\n\n        async def tracked_task():\n            nonlocal running, peak\n            async with lock:\n                running += 1\n                if running > peak:\n                    peak = running\n            await asyncio.sleep(0.05)\n            async with lock:\n                running -= 1\n            return \"ok\"\n\n        tasks = [tracked_task for _ in range(10)]\n        pool = BoundedAsyncPool(concurrency=3)\n        results = await pool.run(tasks)\n\n        self.assertTrue(all(r.ok for r in results))\n        self.assertLessEqual(peak, 3)\n        self.assertGreater(peak, 0)\n\n    async def test_return_order_preserved(self):\n        \"\"\"结果按输入顺序返回，即使完成顺序不同。\"\"\"\n        async def make_task(delay, value):\n            async def _task():\n                await asyncio.sleep(delay)\n                return value\n            return _task\n\n        tasks = [\n            await make_task(0.15, \"a\"),\n            await make_task(0.01, \"b\"),\n            await make_task(0.05, \"c\"),\n            await make_task(0.02, \"d\"),\n        ]\n        pool = BoundedAsyncPool(concurrency=4)\n        results = await pool.run(tasks)\n\n        self.assertEqual([r.index for r in results], [0, 1, 2, 3])\n        self.assertEqual([r.value for r in results], [\"a\", \"b\", \"c\", \"d\"])\n        self.assertTrue(all(r.ok for r in results))\n\n    async def test_single_task_timeout(self):\n        \"\"\"单任务超时被正确标记，其他任务正常完成。\"\"\"\n        async def fast_task():\n            await asyncio.sleep(0.01)\n            return \"fast\"\n\n        async def slow_task():\n            await asyncio.sleep(1.0)\n            return \"slow\"\n\n        tasks = [fast_task, slow_task, fast_task]\n        pool = BoundedAsyncPool(concurrency=3, timeout=0.2)\n        results = await pool.run(t",
+          "request": {
+            "model": "DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw",
+            "messages": [
+              {
+                "role": "user",
+                "content": "只输出Python代码，实现一个有界异步任务池，使用asyncio.Semaphore限制并发，保留输入顺序返回结果，支持单任务超时和错误收集，并给出可运行的演示。实现完整，不调用工具。"
+              },
+              {
+                "role": "assistant",
+                "content": "```python\nimport asyncio\nimport random\nfrom dataclasses import dataclass, field\nfrom typing import Any, Awaitable, Callable, List, Optional\n\n\n@dataclass\nclass TaskResult:\n    index: int\n    ok: bool\n    value: Any = None\n    error: Optional[BaseException] = None\n    timed_out: bool = False\n\n\nclass BoundedAsyncPool:\n    \"\"\"有界异步任务池：限制并发、保留输入顺序、支持单任务超时与错误收集。\"\"\"\n\n    def __init__(self, concurrency: int = 5, timeout: Optional[float] = None):\n        if concurrency <= 0:\n            raise ValueError(\"concurrency must be > 0\")\n        self.concurrency = concurrency\n        self.timeout = timeout\n        self._sem = asyncio.Semaphore(concurrency)\n        self._errors: List[TaskResult] = []\n\n    async def _run_one(\n        self,\n        index: int,\n        fn: Callable[..., Awaitable[Any]],\n        args: tuple,\n        kwargs: dict,\n        timeout: Optional[float],\n    ) -> TaskResult:\n        async with self._sem:\n            try:\n                if timeout is None:\n                    value = await fn(*args, **kwargs)\n                else:\n                    value = await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout)\n                return TaskResult(index=index, ok=True, value=value)\n            except asyncio.TimeoutError as e:\n                return TaskResult(index=index, ok=False, error=e, timed_out=True)\n            except BaseException as e:  # 收集所有异常，不中断整体\n                return TaskResult(index=index, ok=False, error=e)\n\n    async def run(\n        self,\n        tasks: List[Callable[..., Awaitable[Any]]],\n        *,\n        timeout: Optional[float] = None,\n    ) -> List[TaskResult]:\n        \"\"\"并发执行任务，按输入顺序返回 TaskResult 列表。\"\"\"\n        if not tasks:\n            return []\n        timeout = self.timeout if timeout is None else timeout\n        coros = [\n            self._run_one(i, fn, (), {}, timeout)\n            for i, fn in enumerate(tasks)\n        ]\n        results = await asyncio.gather(*coros)\n        self._errors = [r for r in results if not r.ok]\n        return results\n\n    @property\n    def errors(self) -> List[TaskResult]:\n        return list(self._errors)\n\n\n# ---------------- 演示 ----------------\nasync def demo():\n    async def ok_task(i: int, delay: float) -> str:\n        await asyncio.sleep(delay)\n        return f\"task-{i}-done\"\n\n    async def fail_task(i: int) -> str:\n        await asyncio.sleep(0.05)\n        raise RuntimeError(f\"task-{i}-failed\")\n\n    async def slow_task(i: int) -> str:\n        await asyncio.sleep(5)\n        return f\"slow-{i}\"\n\n    # 用闭包包装不同任务，便于统一调用签名\n    tasks = [\n        lambda: ok_task(0, 0.1),\n        lambda: fail_task(1),\n        lambda: ok_task(2, 0.05),\n        lambda: slow_task(3),\n        lambda: ok_task(4, 0.2),\n    ]\n\n    pool = BoundedAsyncPool(concurrency=2, timeout=0.5)\n    results = await pool.run(tasks)\n\n    print(\"=== 结果（保持输入顺序）===\")\n    for r in results:\n        if r.ok:\n            print(f\"[{r.index}] OK -> {r.value}\")\n        else:\n            tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n            print(f\"[{r.index}] {tag} -> {r.error!r}\")\n\n    print(\"\\n=== 错误收集 ===\")\n    for r in pool.errors:\n        tag = \"TIMEOUT\" if r.timed_out else \"ERROR\"\n        print(f\"[{r.index}] {tag}: {r.error!r}\")\n\n\nif __name__ == \"__main__\":\n    asyncio.run(demo())\n```"
+              },
+              {
+                "role": "user",
+                "content": "为上面的异步任务池补充一组unittest.IsolatedAsyncioTestCase测试，覆盖并发上限、返回顺序、超时和异常。只输出Python代码，不调用工具。"
+              }
+            ],
+            "thinking": {
+              "type": "disabled"
+            },
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "seed": 43,
+            "max_tokens": 512,
+            "stream": true,
+            "stream_options": {
+              "include_usage": true
+            }
+          }
+        }
+      ],
+      "retention": [
+        {
+          "total_prompt": 18,
+          "verified_query": null,
+          "selected": false,
+          "reason": "no_pool",
+          "logical_bytes": 0,
+          "released_layers": [],
+          "box_refresh_wait_ms": 0
+        },
+        {
+          "total_prompt": 49,
+          "verified_query": null,
+          "selected": true,
+          "reason": null,
+          "logical_bytes": 25854738432,
+          "released_layers": [
+            39,
+            38,
+            37,
+            36,
+            35,
+            34,
+            33,
+            32
+          ],
+          "box_refresh_wait_ms": 359
+        },
+        {
+          "total_prompt": 54,
+          "verified_query": null,
+          "selected": true,
+          "reason": null,
+          "logical_bytes": 25854738432,
+          "released_layers": [
+            39,
+            38,
+            37,
+            36,
+            35,
+            34,
+            33,
+            32
+          ],
+          "box_refresh_wait_ms": 420
+        },
+        {
+          "total_prompt": 1008,
+          "verified_query": {
+            "rows": 41,
+            "positions": 1008
+          },
+          "selected": true,
+          "reason": null,
+          "logical_bytes": 23298146304,
+          "released_layers": [
+            39,
+            38,
+            37,
+            36,
+            35,
+            34,
+            33,
+            32,
+            31,
+            30,
+            29
+          ],
+          "box_refresh_wait_ms": 325
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "One224/288suite; prior245/310suites support method but are different profiles.",
+    "256Kconfigured,not a256Kfilledpromptstress test.",
+    "No universal35–40TPS claim.",
+    "Selective retention only for<=256uncachedinputtokens or native-verifiedshortsuffix; otherinputs use priorfallback.",
+    "CPU/GPUconditions mayvaryonothermachines.",
+    "Freshstathelperandlonginputexperiments are not shipped."
+  ]
+}
